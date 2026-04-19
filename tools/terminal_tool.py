@@ -762,8 +762,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             if modal_state["managed_mode_blocked"]:
                 raise ValueError(
                     "Modal backend is configured for managed mode, but "
-                    "HERMES_ENABLE_NOUS_MANAGED_TOOLS is not enabled and no direct "
-                    "Modal credentials/config were found. Enable the feature flag or "
+                    "a paid Nous subscription is required for the Tool Gateway and no direct "
+                    "Modal credentials/config were found. Log in with `hermes model` or "
                     "choose TERMINAL_MODAL_MODE=direct/auto."
                 )
             if modal_state["mode"] == "managed":
@@ -1126,7 +1126,7 @@ def terminal_tool(
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, auto-notify the agent when the process exits
-        watch_patterns: List of strings to watch for in background output; triggers notification on match
+        watch_patterns: List of strings to watch for in background output; fires a notification on first match per pattern. Use ONLY for mid-process signals (errors, readiness markers) that appear before exit. For end-of-run markers use notify_on_complete instead — stacking both produces duplicate, delayed notifications.
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -1577,8 +1577,8 @@ def check_terminal_requirements() -> bool:
                 if modal_state["managed_mode_blocked"]:
                     logger.error(
                         "Modal backend selected with TERMINAL_MODAL_MODE=managed, but "
-                        "HERMES_ENABLE_NOUS_MANAGED_TOOLS is not enabled and no direct "
-                        "Modal credentials/config were found. Enable the feature flag "
+                        "a paid Nous subscription is required for the Tool Gateway and no direct "
+                        "Modal credentials/config were found. Log in with `hermes model` "
                         "or choose TERMINAL_MODAL_MODE=direct/auto."
                     )
                     return False
@@ -1724,7 +1724,7 @@ TERMINAL_SCHEMA = {
             "watch_patterns": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "List of strings to watch for in background process output. When any pattern matches a line of output, you'll be notified with the matching text — like notify_on_complete but triggers mid-process on specific output. Use for monitoring logs, watching for errors, or waiting for specific events (e.g. [\"ERROR\", \"FAIL\", \"listening on port\"])."
+                "description": "Strings to watch for in background process output. Fires a notification the first time each pattern matches a line of output. **Use ONLY for mid-process signals** you want to react to before the process exits — errors, readiness markers, intermediate step markers (e.g. [\"ERROR\", \"Traceback\", \"listening on port\"]). Do NOT use for end-of-run markers (summary headers, 'DONE', 'PASS' printed right before exit) — use `notify_on_complete` for that instead. Stacking end-of-run patterns on top of `notify_on_complete` produces duplicate, delayed notifications that arrive after you've already moved on, since delivery is asynchronous and continues after the process exits."
             }
         },
         "required": ["command"]
