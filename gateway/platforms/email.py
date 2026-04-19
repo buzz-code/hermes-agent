@@ -19,6 +19,7 @@ import asyncio
 import email as email_lib
 import imaplib
 import logging
+import mimetypes
 import os
 import re
 import smtplib
@@ -567,7 +568,52 @@ class EmailAdapter(BasePlatformAdapter):
         """Send an image URL as part of an email body."""
         text = caption or ""
         text += f"\n\nImage: {image_url}"
-        return await self.send(chat_id, text.strip(), reply_to, metadata)
+        return await self.send(chat_id, text.strip(), reply_to, metadata=metadata)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a local image file as an email attachment."""
+        return await self.send_document(
+            chat_id, image_path, caption,
+            Path(image_path).name if image_path else None,
+            reply_to, metadata,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an audio file as an email attachment."""
+        return await self.send_document(
+            chat_id, audio_path, caption,
+            Path(audio_path).name if audio_path else None,
+            reply_to, metadata,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a video file as an email attachment."""
+        return await self.send_document(
+            chat_id, video_path, caption,
+            Path(video_path).name if video_path else None,
+            reply_to, metadata,
+        )
 
     async def send_document(
         self,
@@ -626,14 +672,21 @@ class EmailAdapter(BasePlatformAdapter):
         if body:
             msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        # Attach file
+        # Attach file — use proper MIME type for better display in email clients
         p = Path(file_path)
         fname = file_name or p.name
+        mime_type, _ = mimetypes.guess_type(str(p))
+        if mime_type:
+            maintype, subtype = mime_type.split("/", 1)
+        else:
+            maintype, subtype = "application", "octet-stream"
         with open(p, "rb") as f:
-            part = MIMEBase("application", "octet-stream")
+            part = MIMEBase(maintype, subtype)
             part.set_payload(f.read())
             encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={fname}")
+            # Keyword args so Python's email library handles RFC 2231
+            # encoding for non-ASCII filenames automatically
+            part.add_header("Content-Disposition", "attachment", filename=fname)
             msg.attach(part)
 
         smtp = smtplib.SMTP(self._smtp_host, self._smtp_port, timeout=30)
