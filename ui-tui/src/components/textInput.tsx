@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { setInputSelection } from '../app/inputSelectionStore.js'
 import { readClipboardText, writeClipboardText } from '../lib/clipboard.js'
+import { cursorLayout } from '../lib/inputMetrics.js'
 import { isActionMod, isMac, isMacActionFallback } from '../lib/platform.js'
 
 type InkExt = typeof Ink & {
@@ -167,50 +168,6 @@ export function lineNav(s: string, p: number, dir: -1 | 1): null | number {
   return snapPos(s, Math.min(nextBreak + 1 + col, lineEnd))
 }
 
-// mirrors wrap-ansi(..., { wordWrap: false, hard: true }) so the declared
-// cursor lines up with what <Text wrap="wrap-char"> actually renders
-export function cursorLayout(value: string, cursor: number, cols: number) {
-  const pos = Math.max(0, Math.min(cursor, value.length))
-  const w = Math.max(1, cols)
-
-  let col = 0,
-    line = 0
-
-  for (const { segment, index } of seg().segment(value)) {
-    if (index >= pos) {
-      break
-    }
-
-    if (segment === '\n') {
-      line++
-      col = 0
-
-      continue
-    }
-
-    const sw = stringWidth(segment)
-
-    if (!sw) {
-      continue
-    }
-
-    if (col + sw > w) {
-      line++
-      col = 0
-    }
-
-    col += sw
-  }
-
-  // trailing cursor-cell overflows to the next row at the wrap column
-  if (col >= w) {
-    line++
-    col = 0
-  }
-
-  return { column: col, line }
-}
-
 export function offsetFromPosition(value: string, row: number, col: number, cols: number) {
   if (!value.length) {
     return 0
@@ -346,6 +303,8 @@ export function TextInput({
   const pasteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pastePos = useRef(0)
   const editVersionRef = useRef(0)
+  const parentChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pendingParentValue = useRef<string | null>(null)
   const undo = useRef<{ cursor: number; value: string }[]>([])
   const redo = useRef<{ cursor: number; value: string }[]>([])
 
@@ -428,11 +387,40 @@ export function TextInput({
       if (pasteTimer.current) {
         clearTimeout(pasteTimer.current)
       }
+
+      if (parentChangeTimer.current) {
+        clearTimeout(parentChangeTimer.current)
+      }
     },
     []
   )
 
-  const commit = (next: string, nextCur: number, track = true) => {
+  const flushParentChange = () => {
+    if (parentChangeTimer.current) {
+      clearTimeout(parentChangeTimer.current)
+      parentChangeTimer.current = null
+    }
+
+    const next = pendingParentValue.current
+    pendingParentValue.current = null
+
+    if (next !== null) {
+      self.current = true
+      cbChange.current(next)
+    }
+  }
+
+  const scheduleParentChange = (next: string) => {
+    pendingParentValue.current = next
+
+    if (parentChangeTimer.current) {
+      return
+    }
+
+    parentChangeTimer.current = setTimeout(flushParentChange, 16)
+  }
+
+  const commit = (next: string, nextCur: number, track = true, syncParent = true) => {
     const prev = vRef.current
     const c = snapPos(next, nextCur)
     editVersionRef.current += 1
@@ -457,8 +445,13 @@ export function TextInput({
     vRef.current = next
 
     if (next !== prev) {
-      self.current = true
-      cbChange.current(next)
+      if (syncParent) {
+        flushParentChange()
+        self.current = true
+        cbChange.current(next)
+      } else {
+        scheduleParentChange(next)
+      }
     }
   }
 
@@ -640,9 +633,13 @@ export function TextInput({
       }
 
       if (k.return) {
-        k.shift || (isMac ? isActionMod(k) : k.meta)
-          ? commit(ins(vRef.current, curRef.current, '\n'), curRef.current + 1)
-          : cbSubmit.current?.(vRef.current)
+        if (k.shift || (isMac ? isActionMod(k) : k.meta)) {
+          flushParentChange()
+          commit(ins(vRef.current, curRef.current, '\n'), curRef.current + 1)
+        } else {
+          flushParentChange()
+          cbSubmit.current?.(vRef.current)
+        }
 
         return
       }
@@ -784,8 +781,25 @@ export function TextInput({
             v = v.slice(0, range.start) + text + v.slice(range.end)
             c = range.start + text.length
           } else {
+            const simpleAppend =
+              focus &&
+              termFocus &&
+              !selected &&
+              !mask &&
+              !placeholder &&
+              c === v.length &&
+              !v.includes('\n') &&
+              stringWidth(text) === text.length &&
+              stringWidth(v) + text.length < Math.max(1, columns)
+
             v = v.slice(0, c) + text + v.slice(c)
             c += text.length
+
+            if (simpleAppend) {
+              commit(v, c, true, false)
+
+              return
+            }
           }
         } else {
           return
