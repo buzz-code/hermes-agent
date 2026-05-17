@@ -95,13 +95,31 @@ class TestEstimateMessagesTokensRough:
         assert result == (len(str(msg)) + 3) // 4
 
     def test_message_with_list_content(self):
-        """Vision messages with multimodal content arrays."""
+        """Vision messages with multimodal content arrays.
+
+        Image parts are counted at a flat ~1500-token rate per image
+        rather than counting the base64 char length, so a tiny stub
+        payload still registers as full image cost.
+        """
         msg = {"role": "user", "content": [
             {"type": "text", "text": "describe"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
         ]}
         result = estimate_messages_tokens_rough([msg])
-        assert result == (len(str(msg)) + 3) // 4
+        # Flat cost = 1500 per image plus the small text overhead. Allow
+        # a small band so this isn't a change-detector for the exact
+        # string representation.
+        assert 1500 <= result < 2000
+
+    def test_message_with_huge_base64_image_stays_bounded(self):
+        """A 1MB base64 PNG must not explode to ~250K tokens."""
+        huge = "A" * (1024 * 1024)
+        msg = {"role": "tool", "tool_call_id": "c1", "content": [
+            {"type": "text", "text": "x"},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{huge}"}},
+        ]}
+        result = estimate_messages_tokens_rough([msg])
+        assert result < 5000
 
 
 # =========================================================================
@@ -185,6 +203,43 @@ class TestDefaultContextLengths:
                 ("grok-2-vision", 8192),
                 ("grok-2-vision-1212", 8192),
                 ("grok-beta", 131072),
+            ]
+            for model_id, expected_ctx in cases:
+                actual = get_model_context_length(model_id)
+                assert actual == expected_ctx, (
+                    f"{model_id}: expected {expected_ctx}, got {actual}"
+                )
+
+    def test_deepseek_v4_models_1m_context(self):
+        from agent.model_metadata import get_model_context_length
+        from unittest.mock import patch as mock_patch
+
+        expected_keys = {
+            "deepseek-v4-pro": 1_000_000,
+            "deepseek-v4-flash": 1_000_000,
+            "deepseek-chat": 1_000_000,
+            "deepseek-reasoner": 1_000_000,
+        }
+        for key, value in expected_keys.items():
+            assert key in DEFAULT_CONTEXT_LENGTHS, f"{key} missing"
+            assert DEFAULT_CONTEXT_LENGTHS[key] == value, (
+                f"{key} should be {value}, got {DEFAULT_CONTEXT_LENGTHS[key]}"
+            )
+
+        # Longest-first substring matching must resolve both the bare V4
+        # ids (native DeepSeek) and the vendor-prefixed forms (OpenRouter
+        # / Nous Portal) to 1M without probing down to the legacy 128K
+        # ``deepseek`` substring fallback.
+        with mock_patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.get_cached_context_length", return_value=None):
+            cases = [
+                ("deepseek-v4-pro", 1_000_000),
+                ("deepseek-v4-flash", 1_000_000),
+                ("deepseek/deepseek-v4-pro", 1_000_000),
+                ("deepseek/deepseek-v4-flash", 1_000_000),
+                ("deepseek-chat", 1_000_000),
+                ("deepseek-reasoner", 1_000_000),
             ]
             for model_id, expected_ctx in cases:
                 actual = get_model_context_length(model_id)
@@ -303,7 +358,9 @@ class TestCodexOAuthContextLength:
         from agent.model_metadata import get_model_context_length
 
         # OpenRouter — should hit its own catalog path first; when mocked
-        # empty, falls through to hardcoded DEFAULT_CONTEXT_LENGTHS (400k).
+        # empty, falls through to hardcoded DEFAULT_CONTEXT_LENGTHS (1.05M,
+        # matching the real direct-API value — Codex OAuth's 272k cap is
+        # provider-specific and must not leak here).
         with patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
              patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
@@ -314,7 +371,7 @@ class TestCodexOAuthContextLength:
                 api_key="",
                 provider="openrouter",
             )
-        assert ctx == 400_000, (
+        assert ctx == 1_050_000, (
             f"Non-Codex gpt-5.5 resolved to {ctx}; Codex 272k override "
             "leaked outside openai-codex provider"
         )

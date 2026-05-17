@@ -5,11 +5,11 @@ session search, web extraction, vision analysis, browser vision) picks up
 the best available backend without duplicating fallback logic.
 
 Resolution order for text tasks (auto mode):
-  1. OpenRouter  (OPENROUTER_API_KEY)
-  2. Nous Portal (~/.hermes/auth.json active provider)
-  3. Custom endpoint (config.yaml model.base_url + OPENAI_API_KEY)
-  4. Codex OAuth (Responses API via chatgpt.com with gpt-5.3-codex,
-     wrapped to look like a chat.completions client)
+  1. User's main provider + main model (used regardless of provider type —
+     aggregators, direct API-key providers, native Anthropic, Codex, etc.)
+  2. OpenRouter  (OPENROUTER_API_KEY)
+  3. Nous Portal (~/.hermes/auth.json active provider)
+  4. Custom endpoint (config.yaml model.base_url + OPENAI_API_KEY)
   5. Native Anthropic
   6. Direct API-key providers (z.ai/GLM, Kimi/Moonshot, MiniMax, MiniMax-CN)
   7. None
@@ -18,10 +18,16 @@ Resolution order for vision/multimodal tasks (auto mode):
   1. Selected main provider, if it is one of the supported vision backends below
   2. OpenRouter
   3. Nous Portal
-  4. Codex OAuth (gpt-5.3-codex supports vision via Responses API)
-  5. Native Anthropic
-  6. Custom endpoint (for local vision models: Qwen-VL, LLaVA, Pixtral, etc.)
-  7. None
+  4. Native Anthropic
+  5. Custom endpoint (for local vision models: Qwen-VL, LLaVA, Pixtral, etc.)
+  6. None
+
+Codex OAuth (ChatGPT-account auth) is intentionally NOT in either
+fallback chain: OpenAI gates this endpoint behind an undocumented,
+shifting model allow-list, so "just try Codex with a hardcoded model"
+rots on its own.  Codex is used only when the user's main provider *is*
+openai-codex (Step 1 above) or when a caller explicitly requests it with
+a model (auxiliary.<task>.provider + auxiliary.<task>.model).
 
 Per-task overrides are configured in config.yaml under the ``auxiliary:`` section
 (e.g. ``auxiliary.vision.provider``, ``auxiliary.compression.model``).
@@ -41,10 +47,57 @@ import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
-from openai import OpenAI
+# NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
+# openai SDK pulls a large type tree (~240 ms cold, including responses/*,
+# graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
+# first call and forwards, so:
+#   (a) the 15+ in-module `OpenAI(...)` construction sites work unchanged
+#       (Python's function-scope name lookup resolves `OpenAI` to the proxy
+#       object bound in module globals here, without triggering any import);
+#   (b) external code can still do `auxiliary_client.OpenAI` or
+#       `patch("agent.auxiliary_client.OpenAI", ...)` — tests see the proxy,
+#       and patch replaces the module attribute as usual;
+#   (c) `OpenAI` as a type annotation resolves at runtime to the proxy class
+#       (which is harmless — annotations aren't type-checked at runtime).
+# See tests/agent/test_auxiliary_client.py for patch patterns this supports.
+if TYPE_CHECKING:
+    from openai import OpenAI  # noqa: F401 — type hints only
+
+_OPENAI_CLS_CACHE: Optional[type] = None
+
+
+def _load_openai_cls() -> type:
+    """Import and cache ``openai.OpenAI``."""
+    global _OPENAI_CLS_CACHE
+    if _OPENAI_CLS_CACHE is None:
+        from openai import OpenAI as _cls
+        _OPENAI_CLS_CACHE = _cls
+    return _OPENAI_CLS_CACHE
+
+
+class _OpenAIProxy:
+    """Module-level proxy that looks like the ``openai.OpenAI`` class.
+
+    Forwards ``OpenAI(...)`` calls and ``isinstance(x, OpenAI)`` checks to the
+    real SDK class, importing the SDK lazily on first use.
+    """
+
+    __slots__ = ()
+
+    def __call__(self, *args, **kwargs):
+        return _load_openai_cls()(*args, **kwargs)
+
+    def __instancecheck__(self, obj):
+        return isinstance(obj, _load_openai_cls())
+
+    def __repr__(self):
+        return "<lazy openai.OpenAI proxy>"
+
+
+OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
 from agent.credential_pool import load_pool
 from hermes_cli.config import get_hermes_home
@@ -52,6 +105,14 @@ from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_isinstance(obj: Any, maybe_type: Any) -> bool:
+    """Return False instead of raising when a patched symbol is not a type."""
+    try:
+        return isinstance(obj, maybe_type)
+    except TypeError:
+        return False
 
 
 def _extract_url_query_params(url: str):
@@ -82,6 +143,8 @@ _PROVIDER_ALIASES = {
     "moonshot": "kimi-coding",
     "kimi-cn": "kimi-coding-cn",
     "moonshot-cn": "kimi-coding-cn",
+    "gmi-cloud": "gmi",
+    "gmicloud": "gmi",
     "minimax-china": "minimax-cn",
     "minimax_cn": "minimax-cn",
     "claude": "anthropic",
@@ -92,6 +155,10 @@ _PROVIDER_ALIASES = {
     "github-models": "copilot",
     "github-copilot-acp": "copilot-acp",
     "copilot-acp-agent": "copilot-acp",
+    "tencent": "tencent-tokenhub",
+    "tokenhub": "tencent-tokenhub",
+    "tencent-cloud": "tencent-tokenhub",
+    "tencentmaas": "tencent-tokenhub",
 }
 
 
@@ -129,6 +196,12 @@ def _is_kimi_model(model: Optional[str]) -> bool:
     return bare.startswith("kimi-") or bare == "kimi"
 
 
+def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
+    """True for Arcee Trinity Large Thinking (direct or via OpenRouter)."""
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return bare == "trinity-large-thinking"
+
+
 def _fixed_temperature_for_model(
     model: Optional[str],
     base_url: Optional[str] = None,
@@ -146,16 +219,54 @@ def _fixed_temperature_for_model(
     if _is_kimi_model(model):
         logger.debug("Omitting temperature for Kimi model %r (server-managed)", model)
         return OMIT_TEMPERATURE
+    if _is_arcee_trinity_thinking(model):
+        return 0.5
+    return None
+
+
+def _compression_threshold_for_model(model: Optional[str]) -> Optional[float]:
+    """Return a context-compression threshold override for specific models.
+
+    The threshold is the fraction of the model's context window that must be
+    consumed before Hermes triggers summarization.  Higher values delay
+    compression and preserve more raw context.
+
+    Returns a float in (0, 1] to override the global ``compression.threshold``
+    config value, or ``None`` to leave the user's config value unchanged.
+    """
+    if _is_arcee_trinity_thinking(model):
+        return 0.75
     return None
 
 # Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
-_API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
+def _get_aux_model_for_provider(provider_id: str) -> str:
+    """Return the cheap auxiliary model for a provider.
+
+    Reads from ProviderProfile.default_aux_model first, falling back to the
+    legacy hardcoded dict for providers that predate the profiles system.
+    """
+    try:
+        from providers import get_provider_profile
+        _p = get_provider_profile(provider_id)
+        if _p and _p.default_aux_model:
+            return _p.default_aux_model
+    except Exception:
+        pass
+    return _API_KEY_PROVIDER_AUX_MODELS_FALLBACK.get(provider_id, "")
+
+
+# Fallback for providers not yet migrated to ProviderProfile.default_aux_model,
+# plus providers we intentionally keep pinned here (e.g. Anthropic predates
+# profiles). New providers should set default_aux_model on their profile instead.
+_API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "gemini": "gemini-3-flash-preview",
     "zai": "glm-4.5-flash",
     "kimi-coding": "kimi-k2-turbo-preview",
     "stepfun": "step-3.5-flash",
     "kimi-coding-cn": "kimi-k2-turbo-preview",
+    "gmi": "google/gemini-3.1-flash-lite-preview",
     "minimax": "MiniMax-M2.7",
+    "minimax-oauth": "MiniMax-M2.7-highspeed",
     "minimax-cn": "MiniMax-M2.7",
     "anthropic": "claude-haiku-4-5-20251001",
     "ai-gateway": "google/gemini-3-flash",
@@ -163,7 +274,12 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
     "opencode-go": "glm-5",
     "kilocode": "google/gemini-3-flash-preview",
     "ollama-cloud": "nemotron-3-nano:30b",
+    "tencent-tokenhub": "hy3-preview",
 }
+
+# Legacy alias — callers that haven't been updated to _get_aux_model_for_provider()
+# can still use this dict directly. Kept in sync with _FALLBACK above.
+_API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALLBACK
 
 # Vision-specific model overrides for direct providers.
 # When the user's main provider has a dedicated vision/multimodal model that
@@ -174,12 +290,84 @@ _PROVIDER_VISION_MODELS: Dict[str, str] = {
     "zai": "glm-5v-turbo",
 }
 
-# OpenRouter app attribution headers
-_OR_HEADERS = {
+# Providers whose endpoint does not accept image input, even though the
+# provider's broader ecosystem has vision models available elsewhere.  When
+# `auxiliary.vision.provider: auto` sees one of these as the main provider,
+# it must skip straight to the aggregator chain instead of returning a client
+# that will 404 on every vision request.
+#
+# kimi-coding / kimi-coding-cn: the Kimi Coding Plan routes through
+# api.kimi.com/coding (Anthropic Messages wire) which Kimi's own docs
+# describe as having no image_in capability. Vision lives on the separate
+# Kimi Platform (api.moonshot.ai, OpenAI-wire, pay-as-you-go).  See #17076.
+_PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
+    "kimi-coding",
+    "kimi-coding-cn",
+})
+
+# OpenRouter app attribution headers (base — always sent).
+# `X-Title` is the canonical attribution header OpenRouter's dashboard
+# reads; the previous `X-OpenRouter-Title` label was not recognized there.
+_OR_HEADERS_BASE = {
     "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-    "X-OpenRouter-Title": "Hermes Agent",
+    "X-Title": "Hermes Agent",
     "X-OpenRouter-Categories": "productivity,cli-agent",
 }
+
+# Truthy values for boolean env-var parsing.
+_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def build_or_headers(or_config: dict | None = None) -> dict:
+    """Build OpenRouter headers, optionally including response-cache headers.
+
+    Precedence for response cache: env var > config.yaml > default (enabled).
+
+    Environment variables:
+        ``HERMES_OPENROUTER_CACHE`` — truthy (``1``/``true``/``yes``/``on``)
+            enables caching; ``0``/``false``/``no``/``off`` disables.
+            Overrides ``openrouter.response_cache`` in config.yaml.
+        ``HERMES_OPENROUTER_CACHE_TTL`` — integer seconds (1-86400).
+            Overrides ``openrouter.response_cache_ttl`` in config.yaml.
+
+    *or_config* is the ``openrouter`` section from config.yaml.  When *None*,
+    falls back to reading config from disk via ``load_config()``.
+    """
+    headers = dict(_OR_HEADERS_BASE)
+
+    # Resolve config from disk if not provided.
+    if or_config is None:
+        try:
+            from hermes_cli.config import load_config
+            or_config = load_config().get("openrouter", {})
+        except Exception:
+            or_config = {}
+
+    # Determine cache enabled: env var overrides config.
+    env_cache = os.environ.get("HERMES_OPENROUTER_CACHE", "").strip().lower()
+    if env_cache:
+        cache_enabled = env_cache in _TRUTHY_ENV_VALUES
+    else:
+        cache_enabled = or_config.get("response_cache", False)
+
+    if not cache_enabled:
+        return headers
+
+    headers["X-OpenRouter-Cache"] = "true"
+
+    # Determine TTL: env var overrides config.
+    env_ttl = os.environ.get("HERMES_OPENROUTER_CACHE_TTL", "").strip()
+    if env_ttl:
+        if env_ttl.isdigit():
+            ttl = int(env_ttl)
+            if 1 <= ttl <= 86400:
+                headers["X-OpenRouter-Cache-TTL"] = str(ttl)
+    else:
+        ttl = or_config.get("response_cache_ttl", 300)
+        if isinstance(ttl, (int, float)) and 1 <= ttl <= 86400:
+            headers["X-OpenRouter-Cache-TTL"] = str(int(ttl))
+
+    return headers
 
 # Vercel AI Gateway app attribution headers. HTTP-Referer maps to
 # referrerUrl and X-Title maps to appName in the gateway's analytics.
@@ -206,12 +394,14 @@ _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 
-# Codex fallback: uses the Responses API (the only endpoint the Codex
-# OAuth token can access) with a fast model for auxiliary tasks.
-# ChatGPT-backed Codex accounts currently reject gpt-5.3-codex for these
-# auxiliary flows, while gpt-5.2-codex remains broadly available and supports
-# vision via Responses.
-_CODEX_AUX_MODEL = "gpt-5.2-codex"
+# Codex OAuth endpoint used when a caller explicitly requests
+# provider="openai-codex".  There is deliberately no hardcoded default
+# model: the set of models OpenAI accepts on this endpoint for
+# ChatGPT-account auth is an undocumented, shifting allow-list, and
+# pinning one here has drifted silently twice (gpt-5.3-codex → gpt-5.2-codex
+# → gpt-5.4 over 6 weeks in early 2026).  Callers must pass the model
+# they want explicitly (from config.yaml model.model, auxiliary.<task>.model,
+# or the user's active Codex model selection).
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 
@@ -265,8 +455,21 @@ def _to_openai_base_url(base_url: str) -> str:
     """
     url = str(base_url or "").strip().rstrip("/")
     if url.endswith("/anthropic"):
+        # ZAI (open.bigmodel.cn) uses /api/anthropic for Anthropic wire
+        # but /api/paas/v4 for OpenAI wire — the generic /v1 rewrite is wrong.
+        if "open.bigmodel.cn" in url or "bigmodel" in url:
+            rewritten = url[: -len("/anthropic")] + "/paas/v4"
+            logger.debug("Auxiliary client: rewrote ZAI base URL %s → %s", url, rewritten)
+            return rewritten
         rewritten = url[: -len("/anthropic")] + "/v1"
         logger.debug("Auxiliary client: rewrote base URL %s → %s", url, rewritten)
+        return rewritten
+    if "api.kimi.com" in url and url.endswith("/coding"):
+        # Kimi Code uses /coding/v1/messages for Anthropic SDK (appends /v1/messages)
+        # but /coding/v1/chat/completions for OpenAI SDK (appends /chat/completions)
+        # Without /v1 here, OpenAI SDK hits /coding/chat/completions — a 404.
+        rewritten = url + "/v1"
+        logger.debug("Auxiliary client: rewrote Kimi base URL %s → %s", url, rewritten)
         return rewritten
     return url
 
@@ -285,6 +488,29 @@ def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
     except Exception as exc:
         logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
         return True, None
+
+
+def _peek_pool_entry(provider: str) -> Optional[Any]:
+    """Best-effort current/next pool entry without mutating selection order."""
+    try:
+        pool = load_pool(provider)
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not load pool for %s (peek): %s", provider, exc)
+        return None
+    if not pool or not pool.has_credentials():
+        return None
+    try:
+        current_fn = getattr(pool, "current", None)
+        if callable(current_fn):
+            current = current_fn()
+            if current is not None:
+                return current
+        peek_fn = getattr(pool, "peek", None)
+        if callable(peek_fn):
+            return peek_fn()
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not peek pool entry for %s: %s", provider, exc)
+    return None
 
 
 def _pool_runtime_api_key(entry: Any) -> str:
@@ -399,8 +625,48 @@ class _CodexCompletionsAdapter:
             "store": False,
         }
 
+        # Preserve the chat.completions timeout contract. This adapter is used
+        # by auxiliary calls such as context compression; if the timeout is not
+        # forwarded and enforced, a Codex Responses stream can sit behind a
+        # dead-looking CLI until the user force-interrupts the whole session.
+        timeout = kwargs.get("timeout")
+        if timeout is not None:
+            resp_kwargs["timeout"] = timeout
+
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
+
+        # Translate extra_body.reasoning (chat.completions shape) into the
+        # Responses API's top-level reasoning + include fields.  Mirrors
+        # agent/transports/codex.py::build_kwargs() so auxiliary callers
+        # that configure reasoning via auxiliary.<task>.extra_body get the
+        # same behavior as the main agent's Codex transport.
+        extra_body = kwargs.get("extra_body") or {}
+        if isinstance(extra_body, dict):
+            reasoning_cfg = extra_body.get("reasoning")
+            if isinstance(reasoning_cfg, dict):
+                if reasoning_cfg.get("enabled") is False:
+                    # Reasoning explicitly disabled — do not set reasoning
+                    # or include.  The Codex backend still thinks by
+                    # default, but we honor the caller's intent where the
+                    # API allows it.
+                    pass
+                else:
+                    # Truthy-only check mirrors agent/transports/codex.py
+                    # build_kwargs(): falsy values (None, "", 0) fall back
+                    # to the default rather than being forwarded to the
+                    # Codex backend, which rejects e.g. {"effort": null}
+                    # with a 400.
+                    effort = reasoning_cfg.get("effort") or "medium"
+                    # Codex backend rejects "minimal"; clamp to "low" to
+                    # match the main-agent Codex transport behavior.
+                    if effort == "minimal":
+                        effort = "low"
+                    resp_kwargs["reasoning"] = {
+                        "effort": effort,
+                        "summary": "auto",
+                    }
+                    resp_kwargs["include"] = ["reasoning.encrypted_content"]
 
         # Tools support for auxiliary callers (e.g. skills_hub) that pass function schemas
         tools = kwargs.get("tools")
@@ -424,6 +690,37 @@ class _CodexCompletionsAdapter:
         text_parts: List[str] = []
         tool_calls_raw: List[Any] = []
         usage = None
+        total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
+        deadline = time.monotonic() + float(total_timeout) if total_timeout else None
+        timed_out = threading.Event()
+        timeout_timer: Optional[threading.Timer] = None
+
+        def _timeout_message() -> str:
+            return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
+
+        def _close_client_on_timeout() -> None:
+            timed_out.set()
+            close = getattr(self._client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
+
+        def _check_cancelled() -> None:
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out.set()
+                raise TimeoutError(_timeout_message())
+            try:
+                from tools.interrupt import is_interrupted
+                if is_interrupted():
+                    raise InterruptedError("Codex auxiliary Responses stream interrupted")
+            except InterruptedError:
+                raise
+            except Exception:
+                # Interrupt state is a best-effort UX hook; never make it a
+                # new failure mode for auxiliary calls.
+                pass
 
         try:
             # Collect output items and text deltas during streaming —
@@ -432,8 +729,14 @@ class _CodexCompletionsAdapter:
             collected_output_items: List[Any] = []
             collected_text_deltas: List[str] = []
             has_function_calls = False
+            if total_timeout:
+                timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
+                timeout_timer.daemon = True
+                timeout_timer.start()
+            _check_cancelled()
             with self._client.responses.stream(**resp_kwargs) as stream:
                 for _event in stream:
+                    _check_cancelled()
                     _etype = getattr(_event, "type", "")
                     if _etype == "response.output_item.done":
                         _done = getattr(_event, "item", None)
@@ -445,6 +748,7 @@ class _CodexCompletionsAdapter:
                             collected_text_deltas.append(_delta)
                     elif "function_call" in _etype:
                         has_function_calls = True
+                _check_cancelled()
                 final = stream.get_final_response()
 
             # Backfill empty output from collected stream events
@@ -504,8 +808,13 @@ class _CodexCompletionsAdapter:
                     total_tokens=getattr(resp_usage, "total_tokens", 0),
                 )
         except Exception as exc:
+            if timed_out.is_set():
+                raise TimeoutError(_timeout_message()) from exc
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
             raise
+        finally:
+            if timeout_timer is not None:
+                timeout_timer.cancel()
 
         content = "".join(text_parts).strip() or None
 
@@ -599,7 +908,14 @@ class _AnthropicCompletionsAdapter:
         model = kwargs.get("model", self._model)
         tools = kwargs.get("tools")
         tool_choice = kwargs.get("tool_choice")
-        max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or 2000
+        # ZAI's Anthropic-compatible endpoint rejects max_tokens on vision
+        # models (glm-4v-flash etc.) with error code 1210.  When the caller
+        # signals this by setting _skip_zai_max_tokens in kwargs, omit it.
+        _skip_mt = kwargs.pop("_skip_zai_max_tokens", False)
+        if _skip_mt:
+            max_tokens = None
+        else:
+            max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or 2000
         temperature = kwargs.get("temperature")
 
         normalized_tool_choice = None
@@ -709,6 +1025,116 @@ class AsyncAnthropicAuxiliaryClient:
         self.chat = _AsyncAnthropicChatShim(async_adapter)
         self.api_key = sync_wrapper.api_key
         self.base_url = sync_wrapper.base_url
+
+
+def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
+    """True if the endpoint at ``base_url`` speaks the Anthropic Messages
+    protocol instead of OpenAI chat.completions.
+
+    Mirrors ``hermes_cli.runtime_provider._detect_api_mode_for_url`` so the
+    auxiliary client and the main agent stay in sync on transport selection.
+    Covers:
+
+    - Any URL ending in ``/anthropic`` (MiniMax, Zhipu GLM, LiteLLM proxies,
+      Anthropic-compatible gateways).
+    - ``api.kimi.com/coding`` (Kimi Coding Plan — the /coding route only
+      speaks Claude-Code's native Anthropic shape; ``chat.completions``
+      returns 404 on Anthropic-only model aliases like ``kimi-for-coding``).
+    - ``api.anthropic.com`` (native Anthropic).
+    """
+    normalized = (base_url or "").strip().lower().rstrip("/")
+    if not normalized:
+        return False
+    if normalized.endswith("/anthropic"):
+        return True
+    hostname = base_url_hostname(normalized)
+    if hostname == "api.anthropic.com":
+        return True
+    if hostname == "api.kimi.com" and "/coding" in normalized:
+        return True
+    return False
+
+
+def _maybe_wrap_anthropic(
+    client_obj: Any,
+    model: str,
+    api_key: str,
+    base_url: str,
+    api_mode: Optional[str] = None,
+) -> Any:
+    """Rewrap a plain OpenAI client in ``AnthropicAuxiliaryClient`` when
+    the endpoint actually speaks Anthropic Messages.
+
+    This is the single chokepoint for aux-client transport correction.
+    Runs at the end of every ``resolve_provider_client`` branch so that
+    api_key providers (Kimi Coding Plan), the ``custom`` endpoint, and
+    future /anthropic gateways all land on the right wire format
+    regardless of which branch built the client.
+
+    Returns ``client_obj`` unchanged when:
+
+    - It's already an Anthropic/Codex/Gemini/CopilotACP wrapper.
+    - The endpoint is an OpenAI-wire endpoint.
+    - ``api_mode`` is explicitly set to a non-Anthropic transport.
+    - The ``anthropic`` SDK is not installed (falls back to OpenAI wire).
+    """
+    # Already wrapped — don't double-wrap.
+    if _safe_isinstance(client_obj, AnthropicAuxiliaryClient):
+        return client_obj
+    # Other specialized adapters we should never re-dispatch.
+    if _safe_isinstance(client_obj, CodexAuxiliaryClient):
+        return client_obj
+    try:
+        from agent.gemini_native_adapter import GeminiNativeClient
+        if _safe_isinstance(client_obj, GeminiNativeClient):
+            return client_obj
+    except ImportError:
+        pass
+    try:
+        from agent.copilot_acp_client import CopilotACPClient
+        if _safe_isinstance(client_obj, CopilotACPClient):
+            return client_obj
+    except ImportError:
+        pass
+
+    # Explicit non-anthropic api_mode wins over URL heuristics.
+    if api_mode and api_mode != "anthropic_messages":
+        return client_obj
+
+    should_wrap = (
+        api_mode == "anthropic_messages"
+        or _endpoint_speaks_anthropic_messages(base_url)
+    )
+    if not should_wrap:
+        return client_obj
+
+    try:
+        from agent.anthropic_adapter import build_anthropic_client
+    except ImportError:
+        logger.warning(
+            "Endpoint %s speaks Anthropic Messages but the anthropic SDK is "
+            "not installed — falling back to OpenAI-wire (will likely 404).",
+            base_url,
+        )
+        return client_obj
+
+    try:
+        real_client = build_anthropic_client(api_key, base_url)
+    except Exception as exc:
+        logger.warning(
+            "Failed to build Anthropic client for %s (%s) — falling back to "
+            "OpenAI-wire client.", base_url, exc,
+        )
+        return client_obj
+
+    logger.debug(
+        "Auxiliary transport: wrapping client in AnthropicAuxiliaryClient "
+        "(model=%s, base_url=%s, api_mode=%s)",
+        model, base_url[:60] if base_url else "", api_mode or "auto-detected",
+    )
+    return AnthropicAuxiliaryClient(
+        real_client, model, api_key, base_url, is_oauth=False,
+    )
 
 
 def _read_nous_auth() -> Optional[dict]:
@@ -862,10 +1288,9 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             if not api_key:
                 continue
 
-            base_url = _to_openai_base_url(
-                _pool_runtime_base_url(entry, pconfig.inference_base_url) or pconfig.inference_base_url
-            )
-            model = _API_KEY_PROVIDER_AUX_MODELS.get(provider_id)
+            raw_base_url = _pool_runtime_base_url(entry, pconfig.inference_base_url) or pconfig.inference_base_url
+            base_url = _to_openai_base_url(raw_base_url)
+            model = _get_aux_model_for_provider(provider_id) or None
             if model is None:
                 continue  # skip provider if we don't know a valid aux model
             logger.debug("Auxiliary text client: %s (%s) via pool", pconfig.name, model)
@@ -881,17 +1306,26 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                 from hermes_cli.models import copilot_default_headers
 
                 extra["default_headers"] = copilot_default_headers()
-            return OpenAI(api_key=api_key, base_url=base_url, **extra), model
+            else:
+                try:
+                    from providers import get_provider_profile as _gpf_aux
+                    _ph_aux = _gpf_aux(provider_id)
+                    if _ph_aux and _ph_aux.default_headers:
+                        extra["default_headers"] = dict(_ph_aux.default_headers)
+                except Exception:
+                    pass
+            _client = OpenAI(api_key=api_key, base_url=base_url, **extra)
+            _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
+            return _client, model
 
         creds = resolve_api_key_provider_credentials(provider_id)
         api_key = str(creds.get("api_key", "")).strip()
         if not api_key:
             continue
 
-        base_url = _to_openai_base_url(
-            str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
-        )
-        model = _API_KEY_PROVIDER_AUX_MODELS.get(provider_id)
+        raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
+        base_url = _to_openai_base_url(raw_base_url)
+        model = _get_aux_model_for_provider(provider_id) or None
         if model is None:
             continue  # skip provider if we don't know a valid aux model
         logger.debug("Auxiliary text client: %s (%s)", pconfig.name, model)
@@ -907,7 +1341,17 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             from hermes_cli.models import copilot_default_headers
 
             extra["default_headers"] = copilot_default_headers()
-        return OpenAI(api_key=api_key, base_url=base_url, **extra), model
+        else:
+            try:
+                from providers import get_provider_profile as _gpf_aux2
+                _ph_aux2 = _gpf_aux2(provider_id)
+                if _ph_aux2 and _ph_aux2.default_headers:
+                    extra["default_headers"] = dict(_ph_aux2.default_headers)
+            except Exception:
+                pass
+        _client = OpenAI(api_key=api_key, base_url=base_url, **extra)
+        _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
+        return _client, model
 
     return None, None
 
@@ -916,23 +1360,23 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
 
 
-def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
+def _try_openrouter(explicit_api_key: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
     pool_present, entry = _select_pool_entry("openrouter")
     if pool_present:
-        or_key = _pool_runtime_api_key(entry)
+        or_key = explicit_api_key or _pool_runtime_api_key(entry)
         if not or_key:
             return None, None
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
         logger.debug("Auxiliary client: OpenRouter via pool")
         return OpenAI(api_key=or_key, base_url=base_url,
-                       default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+                       default_headers=build_or_headers()), _OPENROUTER_MODEL
 
-    or_key = os.getenv("OPENROUTER_API_KEY")
+    or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
     if not or_key:
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                   default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+                   default_headers=build_or_headers()), _OPENROUTER_MODEL
 
 
 def _describe_openrouter_unavailable() -> str:
@@ -1019,7 +1463,16 @@ def _read_main_model() -> str:
 
     config.yaml model.default is the single source of truth for the active
     model. Environment variables are no longer consulted.
+
+    Runtime override: when an AIAgent is active with a CLI/gateway-provided
+    model that differs from config.yaml, ``set_runtime_main()`` records the
+    override in a process-local global. This is consulted FIRST so tools
+    that gate on "the active main model" (e.g. ``vision_analyze``'s native
+    fast path) see the live runtime, not the persisted config default.
     """
+    override = _RUNTIME_MAIN_MODEL
+    if isinstance(override, str) and override.strip():
+        return override.strip()
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
@@ -1040,7 +1493,13 @@ def _read_main_provider() -> str:
 
     Returns the lowercase provider id (e.g. "alibaba", "openrouter") or ""
     if not configured.
+
+    Runtime override: see ``_read_main_model`` — same mechanism for the
+    provider half of the runtime tuple.
     """
+    override = _RUNTIME_MAIN_PROVIDER
+    if isinstance(override, str) and override.strip():
+        return override.strip().lower()
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
@@ -1052,6 +1511,32 @@ def _read_main_provider() -> str:
     except Exception:
         pass
     return ""
+
+
+# Process-local override set by AIAgent at session/turn start. Single-threaded
+# per turn — no lock needed. Cleared by ``clear_runtime_main()``.
+_RUNTIME_MAIN_PROVIDER: str = ""
+_RUNTIME_MAIN_MODEL: str = ""
+
+
+def set_runtime_main(provider: str, model: str) -> None:
+    """Record the live runtime provider/model for the current AIAgent.
+
+    Called by ``run_agent.AIAgent._sync_runtime_main_for_aux_routing`` (or
+    equivalent setter) at the top of each turn so that
+    ``_read_main_provider`` / ``_read_main_model`` reflect CLI/gateway
+    overrides instead of the stale config.yaml default.
+    """
+    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
+    _RUNTIME_MAIN_PROVIDER = (provider or "").strip().lower()
+    _RUNTIME_MAIN_MODEL = (model or "").strip()
+
+
+def clear_runtime_main() -> None:
+    """Clear the runtime override (e.g. on session end)."""
+    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
+    _RUNTIME_MAIN_PROVIDER = ""
+    _RUNTIME_MAIN_MODEL = ""
 
 
 def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -1191,10 +1676,32 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
             AnthropicAuxiliaryClient(real_client, model, custom_key, custom_base, is_oauth=False),
             model,
         )
-    return OpenAI(api_key=custom_key, base_url=_clean_base, **_extra), model
+    # URL-based anthropic detection for custom endpoints that didn't set
+    # api_mode explicitly (e.g. kimi.com/coding reached via custom config).
+    _fallback_client = OpenAI(api_key=custom_key, base_url=_clean_base, **_extra)
+    _fallback_client = _maybe_wrap_anthropic(
+        _fallback_client, model, custom_key, custom_base, custom_mode,
+    )
+    return _fallback_client, model
 
 
-def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
+def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
+    """Build a CodexAuxiliaryClient for an explicitly-requested model.
+
+    There is no auto-selection of the Codex model: the ChatGPT-account
+    Codex endpoint's accepted model list is an undocumented, drifting
+    allow-list, so any hardcoded default we pick goes stale.  The caller
+    is responsible for passing the model (e.g. from the user's own
+    ``model.model`` or ``auxiliary.<task>.model`` config).
+
+    Returns (None, None) when no Codex OAuth token is available.
+    """
+    if not model:
+        logger.warning(
+            "Auxiliary client: openai-codex requested without a model; "
+            "pass model explicitly (auxiliary.<task>.model in config.yaml)."
+        )
+        return None, None
     pool_present, entry = _select_pool_entry("openai-codex")
     if pool_present:
         codex_token = _pool_runtime_api_key(entry)
@@ -1210,16 +1717,16 @@ def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
         if not codex_token:
             return None, None
         base_url = _CODEX_AUX_BASE_URL
-    logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", _CODEX_AUX_MODEL)
+    logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", model)
     real_client = OpenAI(
         api_key=codex_token,
         base_url=base_url,
         default_headers=_codex_cloudflare_headers(codex_token),
     )
-    return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
+    return CodexAuxiliaryClient(real_client, model), model
 
 
-def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
+def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
     except ImportError:
@@ -1229,10 +1736,10 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
     if pool_present:
         if entry is None:
             return None, None
-        token = _pool_runtime_api_key(entry)
+        token = explicit_api_key or _pool_runtime_api_key(entry)
     else:
         entry = None
-        token = resolve_anthropic_token()
+        token = explicit_api_key or resolve_anthropic_token()
     if not token:
         return None, None
 
@@ -1255,7 +1762,7 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
 
     from agent.anthropic_adapter import _is_oauth_token
     is_oauth = _is_oauth_token(token)
-    model = _API_KEY_PROVIDER_AUX_MODELS.get("anthropic", "claude-haiku-4-5-20251001")
+    model = _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
     try:
         real_client = build_anthropic_client(token, base_url)
@@ -1271,7 +1778,6 @@ _AUTO_PROVIDER_LABELS = {
     "_try_openrouter": "openrouter",
     "_try_nous": "nous",
     "_try_custom_endpoint": "local/custom",
-    "_try_codex": "openai-codex",
     "_resolve_api_key_provider": "api-key",
 }
 
@@ -1298,12 +1804,18 @@ def _get_provider_chain() -> List[tuple]:
 
     Built at call time (not module level) so that test patches
     on the ``_try_*`` functions are picked up correctly.
+
+    NOTE: ``openai-codex`` is deliberately NOT in this chain.  The
+    ChatGPT-account Codex endpoint only accepts a shifting, undocumented
+    allow-list of model IDs, so falling back to it with a guessed model
+    fails more often than not.  Codex is used only when the user's main
+    provider *is* openai-codex (see Step 1 of ``_resolve_auto``) or when
+    a caller explicitly requests it with a model.
     """
     return [
         ("openrouter", _try_openrouter),
         ("nous", _try_nous),
         ("local/custom", _try_custom_endpoint),
-        ("openai-codex", _try_codex),
         ("api-key", _resolve_api_key_provider),
     ]
 
@@ -1328,6 +1840,39 @@ def _is_payment_error(exc: Exception) -> bool:
     return False
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Detect rate-limit errors that warrant provider fallback.
+
+    Returns True for HTTP 429 errors whose message indicates rate limiting
+    (as opposed to billing/quota exhaustion, which _is_payment_error handles).
+    Also catches OpenAI SDK RateLimitError instances that may not set
+    .status_code on the exception object.
+    """
+    status = getattr(exc, "status_code", None)
+    err_lower = str(exc).lower()
+
+    # OpenAI SDK's RateLimitError sometimes omits .status_code —
+    # detect by class name so we don't miss these.  (PR #8023 pattern)
+    if type(exc).__name__ == "RateLimitError":
+        return True
+
+    if status == 429:
+        # Distinguish rate-limit from billing: billing keywords are handled
+        # by _is_payment_error, everything else on 429 is a rate limit.
+        if any(kw in err_lower for kw in (
+            "rate limit", "rate_limit", "too many requests",
+            "try again", "retry after", "resets in",
+        )):
+            return True
+        # Generic 429 without billing keywords = likely a rate limit
+        if not any(kw in err_lower for kw in (
+            "credits", "insufficient funds", "billing",
+            "payment required", "can only afford",
+        )):
+            return True
+    return False
+
+
 def _is_connection_error(exc: Exception) -> bool:
     """Detect connection/network errors that warrant provider fallback.
 
@@ -1336,10 +1881,12 @@ def _is_connection_error(exc: Exception) -> bool:
     distinct from API errors (4xx/5xx) which indicate the provider IS
     reachable but returned an error.
     """
-    from openai import APIConnectionError, APITimeoutError
-
-    if isinstance(exc, (APIConnectionError, APITimeoutError)):
-        return True
+    try:
+        from openai import APIConnectionError, APITimeoutError
+        if isinstance(exc, (APIConnectionError, APITimeoutError)):
+            return True
+    except ImportError:
+        pass
     # urllib3 / httpx / httpcore connection errors
     err_type = type(exc).__name__
     if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL")):
@@ -1349,6 +1896,16 @@ def _is_connection_error(exc: Exception) -> bool:
         "connection refused", "name or service not known",
         "no route to host", "network is unreachable",
         "timed out", "connection reset",
+        # httpcore / httpx streaming premature-close errors.  These surface
+        # when a proxy or provider drops the connection mid-stream and are
+        # transient by nature — the request should be retried or rerouted.
+        # See issue #18458.
+        "incomplete chunked read",
+        "peer closed connection",
+        "response ended prematurely",
+        "unexpected eof",
+        "remoteprotocolerror",
+        "localprotocolerror",
     )):
         return True
     return False
@@ -1425,6 +1982,211 @@ def _evict_cached_clients(provider: str) -> None:
                 except Exception:
                     pass
             _client_cache.pop(key, None)
+
+
+def _pool_cache_hint(
+    provider: str,
+    *,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Return a stable cache discriminator for pooled providers."""
+    normalized = _normalize_aux_provider(provider)
+    if normalized == "auto":
+        runtime = _normalize_main_runtime(main_runtime)
+        normalized = _normalize_aux_provider(runtime.get("provider") or _read_main_provider())
+    if normalized in ("", "auto", "custom"):
+        return ""
+    entry = _peek_pool_entry(normalized)
+    if entry is None:
+        return ""
+    entry_id = str(getattr(entry, "id", "") or "").strip()
+    if not entry_id:
+        return ""
+    return f"{normalized}:{entry_id}"
+
+
+def _pool_error_context(exc: Exception) -> Dict[str, Any]:
+    status = getattr(exc, "status_code", None)
+    payload: Dict[str, Any] = {"message": str(exc)}
+    if status is not None:
+        payload["status_code"] = status
+    return payload
+
+
+def _recoverable_pool_provider(resolved_provider: str, client: Any) -> Optional[str]:
+    """Infer which provider pool can recover the current auxiliary client."""
+    normalized = _normalize_aux_provider(resolved_provider)
+    if normalized not in ("", "auto", "custom"):
+        return normalized
+    base = str(getattr(client, "base_url", "") or "")
+    if base_url_host_matches(base, "chatgpt.com"):
+        return "openai-codex"
+    if base_url_host_matches(base, "openrouter.ai"):
+        return "openrouter"
+    if base_url_host_matches(base, "inference-api.nousresearch.com"):
+        return "nous"
+    if base_url_host_matches(base, "api.anthropic.com"):
+        return "anthropic"
+    if base_url_host_matches(base, "api.githubcopilot.com"):
+        return "copilot"
+    if base_url_host_matches(base, "api.kimi.com"):
+        return "kimi-coding"
+    return None
+
+
+def _recover_provider_pool(provider: str, exc: Exception) -> bool:
+    """Try same-provider credential-pool recovery for auxiliary calls."""
+    normalized = _normalize_aux_provider(provider)
+    try:
+        pool = load_pool(normalized)
+    except Exception as load_exc:
+        logger.debug("Auxiliary client: could not load pool for %s recovery: %s", normalized, load_exc)
+        return False
+    if not pool or not pool.has_credentials():
+        return False
+
+    status_code = getattr(exc, "status_code", None)
+    error_context = _pool_error_context(exc)
+
+    if _is_auth_error(exc):
+        refreshed = pool.try_refresh_current()
+        if refreshed is not None:
+            _evict_cached_clients(normalized)
+            return True
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=status_code if status_code is not None else 401,
+            error_context=error_context,
+        )
+        if next_entry is not None:
+            _evict_cached_clients(normalized)
+            return True
+        return False
+
+    if _is_payment_error(exc) or _is_rate_limit_error(exc):
+        fallback_status = 402 if _is_payment_error(exc) else 429
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=status_code if status_code is not None else fallback_status,
+            error_context=error_context,
+        )
+        if next_entry is not None:
+            _evict_cached_clients(normalized)
+            return True
+    return False
+
+
+def _retry_same_provider_sync(
+    *,
+    task: Optional[str],
+    resolved_provider: str,
+    resolved_model: Optional[str],
+    resolved_base_url: Optional[str],
+    resolved_api_key: Optional[str],
+    resolved_api_mode: Optional[str],
+    main_runtime: Optional[Dict[str, Any]],
+    final_model: Optional[str],
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+) -> Any:
+    if task == "vision":
+        _, retry_client, retry_model = resolve_vision_provider_client(
+            provider=resolved_provider,
+            model=final_model,
+            base_url=resolved_base_url,
+            api_key=resolved_api_key,
+            async_mode=False,
+        )
+    else:
+        retry_client, retry_model = _get_cached_client(
+            resolved_provider,
+            resolved_model,
+            base_url=resolved_base_url,
+            api_key=resolved_api_key,
+            api_mode=resolved_api_mode,
+            main_runtime=main_runtime,
+        )
+    if retry_client is None:
+        raise RuntimeError(
+            f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
+        )
+
+    retry_base = str(getattr(retry_client, "base_url", "") or "")
+    retry_kwargs = _build_call_kwargs(
+        resolved_provider,
+        retry_model or final_model,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=tools,
+        timeout=effective_timeout,
+        extra_body=effective_extra_body,
+        base_url=retry_base or resolved_base_url,
+    )
+    if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
+        retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+    return _validate_llm_response(
+        retry_client.chat.completions.create(**retry_kwargs), task,
+    )
+
+
+async def _retry_same_provider_async(
+    *,
+    task: Optional[str],
+    resolved_provider: str,
+    resolved_model: Optional[str],
+    resolved_base_url: Optional[str],
+    resolved_api_key: Optional[str],
+    resolved_api_mode: Optional[str],
+    final_model: Optional[str],
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+) -> Any:
+    if task == "vision":
+        _, retry_client, retry_model = resolve_vision_provider_client(
+            provider=resolved_provider,
+            model=final_model,
+            base_url=resolved_base_url,
+            api_key=resolved_api_key,
+            async_mode=True,
+        )
+    else:
+        retry_client, retry_model = _get_cached_client(
+            resolved_provider,
+            resolved_model,
+            async_mode=True,
+            base_url=resolved_base_url,
+            api_key=resolved_api_key,
+            api_mode=resolved_api_mode,
+        )
+    if retry_client is None:
+        raise RuntimeError(
+            f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
+        )
+
+    retry_base = str(getattr(retry_client, "base_url", "") or "")
+    retry_kwargs = _build_call_kwargs(
+        resolved_provider,
+        retry_model or final_model,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=tools,
+        timeout=effective_timeout,
+        extra_body=effective_extra_body,
+        base_url=retry_base or resolved_base_url,
+    )
+    if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
+        retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+    return _validate_llm_response(
+        await retry_client.chat.completions.create(**retry_kwargs), task,
+    )
 
 
 def _refresh_provider_credentials(provider: str) -> bool:
@@ -1617,8 +2379,14 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
 # below — never look up auth env vars ad-hoc.
 
 
-def _to_async_client(sync_client, model: str):
-    """Convert a sync client to its async counterpart, preserving Codex routing."""
+def _to_async_client(sync_client, model: str, is_vision: bool = False):
+    """Convert a sync client to its async counterpart, preserving Codex routing.
+
+    When ``is_vision=True`` and the underlying base URL is Copilot, the
+    resulting async client carries the ``Copilot-Vision-Request: true``
+    header so the request is routed to Copilot's vision-capable
+    infrastructure (otherwise vision payloads silently time out).
+    """
     from openai import AsyncOpenAI
 
     if isinstance(sync_client, CodexAuxiliaryClient):
@@ -1645,13 +2413,29 @@ def _to_async_client(sync_client, model: str):
     }
     sync_base_url = str(sync_client.base_url)
     if base_url_host_matches(sync_base_url, "openrouter.ai"):
-        async_kwargs["default_headers"] = dict(_OR_HEADERS)
+        async_kwargs["default_headers"] = build_or_headers()
     elif base_url_host_matches(sync_base_url, "api.githubcopilot.com"):
-        from hermes_cli.models import copilot_default_headers
+        from hermes_cli.copilot_auth import copilot_request_headers
 
-        async_kwargs["default_headers"] = copilot_default_headers()
+        async_kwargs["default_headers"] = copilot_request_headers(
+            is_agent_turn=True, is_vision=is_vision
+        )
     elif base_url_host_matches(sync_base_url, "api.kimi.com"):
         async_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+    else:
+        # Fall back to profile.default_headers for providers that declare
+        # client-level headers on their ProviderProfile (e.g. attribution
+        # User-Agent strings). Provider is inferred from the hostname.
+        try:
+            from agent.model_metadata import _infer_provider_from_url
+            from providers import get_provider_profile as _gpf_async
+            _inferred = _infer_provider_from_url(sync_base_url)
+            if _inferred:
+                _ph_async = _gpf_async(_inferred)
+                if _ph_async and _ph_async.default_headers:
+                    async_kwargs["default_headers"] = dict(_ph_async.default_headers)
+        except Exception:
+            pass
     return AsyncOpenAI(**async_kwargs), model
 
 
@@ -1676,6 +2460,7 @@ def resolve_provider_client(
     explicit_api_key: str = None,
     api_mode: str = None,
     main_runtime: Optional[Dict[str, Any]] = None,
+    is_vision: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -1708,6 +2493,12 @@ def resolve_provider_client(
         (client, resolved_model) or (None, None) if auth is unavailable.
     """
     _validate_proxy_env_urls()
+    # Preserve the original provider name before alias normalization so a
+    # user-declared ``custom_providers`` entry whose name coincidentally
+    # matches a built-in alias (e.g. user names their custom provider "kimi"
+    # which aliases to "kimi-coding") is still reachable via the named-custom
+    # branch below.
+    original_provider = (provider or "").strip().lower()
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
 
@@ -1733,8 +2524,20 @@ def resolve_provider_client(
                 return True
         return False
 
-    def _wrap_if_needed(client_obj, final_model_str: str, base_url_str: str = ""):
-        """Wrap a plain OpenAI client in CodexAuxiliaryClient if Responses API is needed."""
+    def _wrap_if_needed(client_obj, final_model_str: str, base_url_str: str = "",
+                        api_key_str: str = ""):
+        """Wrap a plain OpenAI client in the correct transport adapter.
+
+        Handles two cases:
+        - ``CodexAuxiliaryClient`` when the endpoint needs the Responses API
+          (explicit ``api_mode=codex_responses`` or api.openai.com + codex
+          model name).
+        - ``AnthropicAuxiliaryClient`` when the endpoint speaks Anthropic
+          Messages (explicit ``api_mode=anthropic_messages``, any ``/anthropic``
+          suffix, ``api.kimi.com/coding``, or ``api.anthropic.com``).
+
+        Clients that are already specialized wrappers pass through unchanged.
+        """
         if _needs_codex_wrap(client_obj, base_url_str, final_model_str):
             logger.debug(
                 "resolve_provider_client: wrapping client in CodexAuxiliaryClient "
@@ -1742,7 +2545,11 @@ def resolve_provider_client(
                 api_mode or "auto-detected", final_model_str,
                 base_url_str[:60] if base_url_str else "")
             return CodexAuxiliaryClient(client_obj, final_model_str)
-        return client_obj
+        # Anthropic-wire endpoints: rewrap plain OpenAI clients so
+        # chat.completions.create() is translated to /v1/messages.
+        return _maybe_wrap_anthropic(
+            client_obj, final_model_str, api_key_str, base_url_str, api_mode,
+        )
 
     # ── Auto: try all providers in priority order ────────────────────
     if provider == "auto":
@@ -1759,12 +2566,12 @@ def resolve_provider_client(
                 "auxiliary provider (using %r instead)", model, resolved)
             model = None
         final_model = model or resolved
-        return (_to_async_client(client, final_model) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
-    # ── OpenRouter ───────────────────────────────────────────────────
+    # ── OpenRouter ───────────────────────────────────────────
     if provider == "openrouter":
-        client, default = _try_openrouter()
+        client, default = _try_openrouter(explicit_api_key=explicit_api_key)
         if client is None:
             logger.warning(
                 "resolve_provider_client: openrouter requested but %s",
@@ -1772,7 +2579,7 @@ def resolve_provider_client(
             )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
-        return (_to_async_client(client, final_model) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
     # ── Nous Portal (OAuth) ──────────────────────────────────────────
@@ -1789,11 +2596,18 @@ def resolve_provider_client(
                            "but Nous Portal not configured (run: hermes auth)")
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
-        return (_to_async_client(client, final_model) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
     # ── OpenAI Codex (OAuth → Responses API) ─────────────────────────
     if provider == "openai-codex":
+        if not model:
+            logger.warning(
+                "resolve_provider_client: openai-codex requested without a "
+                "model; pass model explicitly (e.g. model.model in config.yaml "
+                "or auxiliary.<task>.model for per-task aux routing)."
+            )
+            return None, None
         if raw_codex:
             # Return the raw OpenAI client for callers that need direct
             # access to responses.stream() (e.g., the main agent loop).
@@ -1802,7 +2616,7 @@ def resolve_provider_client(
                 logger.warning("resolve_provider_client: openai-codex requested "
                                "but no Codex OAuth token found (run: hermes model)")
                 return None, None
-            final_model = _normalize_resolved_model(model or _CODEX_AUX_MODEL, provider)
+            final_model = _normalize_resolved_model(model, provider)
             raw_client = OpenAI(
                 api_key=codex_token,
                 base_url=_CODEX_AUX_BASE_URL,
@@ -1810,19 +2624,19 @@ def resolve_provider_client(
             )
             return (raw_client, final_model)
         # Standard path: wrap in CodexAuxiliaryClient adapter
-        client, default = _try_codex()
+        client, default = _build_codex_client(model)
         if client is None:
             logger.warning("resolve_provider_client: openai-codex requested "
                            "but no Codex OAuth token found (run: hermes model)")
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
-        return (_to_async_client(client, final_model) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
     # ── Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY) ───────────
     if provider == "custom":
         if explicit_base_url:
-            custom_base = explicit_base_url.strip()
+            custom_base = _to_openai_base_url(explicit_base_url).strip()
             custom_key = (
                 (explicit_api_key or "").strip()
                 or os.getenv("OPENAI_API_KEY", "").strip()
@@ -1835,7 +2649,7 @@ def resolve_provider_client(
                 )
                 return None, None
             final_model = _normalize_resolved_model(
-                model or _read_main_model() or "gpt-4o-mini",
+                model or (main_runtime.get("model") if main_runtime else None) or "gpt-4o-mini",
                 provider,
             )
             extra = {}
@@ -1845,21 +2659,34 @@ def resolve_provider_client(
             if base_url_host_matches(custom_base, "api.kimi.com"):
                 extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
             elif base_url_host_matches(custom_base, "api.githubcopilot.com"):
-                from hermes_cli.models import copilot_default_headers
-                extra["default_headers"] = copilot_default_headers()
+                from hermes_cli.copilot_auth import copilot_request_headers
+                extra["default_headers"] = copilot_request_headers(
+                    is_agent_turn=True, is_vision=is_vision
+                )
+            else:
+                # Fall back to profile.default_headers for providers that
+                # declare client-level attribution headers on their profile.
+                try:
+                    from providers import get_provider_profile as _gpf_custom
+                    _ph_custom = _gpf_custom(provider)
+                    if _ph_custom and _ph_custom.default_headers:
+                        extra["default_headers"] = dict(_ph_custom.default_headers)
+                except Exception:
+                    pass
             client = OpenAI(api_key=custom_key, base_url=_clean_base, **extra)
-            client = _wrap_if_needed(client, final_model, custom_base)
-            return (_to_async_client(client, final_model) if async_mode
+            client = _wrap_if_needed(client, final_model, custom_base, custom_key)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                     else (client, final_model))
-        # Try custom first, then codex, then API-key providers
-        for try_fn in (_try_custom_endpoint, _try_codex,
-                       _resolve_api_key_provider):
+        # Try custom first, then API-key providers (Codex excluded here:
+        # falling through to Codex with no model is a stale-constant trap).
+        for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
             client, default = try_fn()
             if client is not None:
                 final_model = _normalize_resolved_model(model or default, provider)
                 _cbase = str(getattr(client, "base_url", "") or "")
-                client = _wrap_if_needed(client, final_model, _cbase)
-                return (_to_async_client(client, final_model) if async_mode
+                _ckey = str(getattr(client, "api_key", "") or "")
+                client = _wrap_if_needed(client, final_model, _cbase, _ckey)
+                return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                         else (client, final_model))
         logger.warning("resolve_provider_client: custom/main requested "
                        "but no endpoint credentials found")
@@ -1868,7 +2695,18 @@ def resolve_provider_client(
     # ── Named custom providers (config.yaml providers dict / custom_providers list) ───
     try:
         from hermes_cli.runtime_provider import _get_named_custom_provider
-        custom_entry = _get_named_custom_provider(provider)
+        # When the raw requested name is an alias (``kimi`` → ``kimi-coding``)
+        # and the user defined a ``custom_providers`` entry under that alias
+        # name, the custom entry is the intended target — the built-in alias
+        # rewriting would otherwise hijack the request.  Only preferred when
+        # the raw name is an alias (not a canonical provider name) so custom
+        # entries that coincidentally match a canonical provider (e.g. ``nous``)
+        # still defer to the built-in per `_get_named_custom_provider`'s guard.
+        custom_entry = None
+        if original_provider and original_provider != provider:
+            custom_entry = _get_named_custom_provider(original_provider)
+        if custom_entry is None:
+            custom_entry = _get_named_custom_provider(provider)
         if custom_entry:
             custom_base = custom_entry.get("base_url", "").strip()
             custom_key = custom_entry.get("api_key", "").strip()
@@ -1881,10 +2719,24 @@ def resolve_provider_client(
             entry_api_mode = (api_mode or custom_entry.get("api_mode") or "").strip()
             if custom_base:
                 final_model = _normalize_resolved_model(
-                    model or custom_entry.get("model") or _read_main_model() or "gpt-4o-mini",
+                    model
+                    or custom_entry.get("model")
+                    or (main_runtime.get("model") if main_runtime else None)
+                    or _read_main_model()
+                    or "gpt-4o-mini",
                     provider,
                 )
-                _clean_base2, _dq2 = _extract_url_query_params(custom_base)
+                # anthropic_messages talks to the /anthropic surface directly;
+                # OpenAI-wire paths (chat_completions / codex_responses) need the
+                # /v1 equivalent.  Rewrite only on the OpenAI-wire path so the
+                # Anthropic fallback SDK still sees the original URL.
+                if entry_api_mode == "anthropic_messages":
+                    openai_base = custom_base
+                    raw_base_for_wrap = custom_base
+                else:
+                    openai_base = _to_openai_base_url(custom_base)
+                    raw_base_for_wrap = custom_base
+                _clean_base2, _dq2 = _extract_url_query_params(openai_base)
                 _extra2 = {"default_query": _dq2} if _dq2 else {}
                 logger.debug(
                     "resolve_provider_client: named custom provider %r (%s, api_mode=%s)",
@@ -1903,8 +2755,13 @@ def resolve_provider_client(
                             "installed — falling back to OpenAI-wire.",
                             provider,
                         )
-                        client = OpenAI(api_key=custom_key, base_url=_clean_base2, **_extra2)
-                        return (_to_async_client(client, final_model) if async_mode
+                        # Fallback went OpenAI-wire after all — redo the query
+                        # extraction against the rewritten /v1 URL.
+                        _fallback_base = _to_openai_base_url(custom_base)
+                        _fb_clean, _fb_dq = _extract_url_query_params(_fallback_base)
+                        _fb_extra = {"default_query": _fb_dq} if _fb_dq else {}
+                        client = OpenAI(api_key=custom_key, base_url=_fb_clean, **_fb_extra)
+                        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                                 else (client, final_model))
                     sync_anthropic = AnthropicAuxiliaryClient(
                         real_client, final_model, custom_key, custom_base, is_oauth=False,
@@ -1922,8 +2779,8 @@ def resolve_provider_client(
                 ):
                     client = CodexAuxiliaryClient(client, final_model)
                 else:
-                    client = _wrap_if_needed(client, final_model, custom_base)
-                return (_to_async_client(client, final_model) if async_mode
+                    client = _wrap_if_needed(client, final_model, raw_base_for_wrap, custom_key)
+                return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                         else (client, final_model))
             logger.warning(
                 "resolve_provider_client: named custom provider %r has no base_url",
@@ -1950,15 +2807,21 @@ def resolve_provider_client(
 
     if pconfig.auth_type == "api_key":
         if provider == "anthropic":
-            client, default_model = _try_anthropic()
+            client, default_model = _try_anthropic(explicit_api_key=explicit_api_key)
             if client is None:
                 logger.warning("resolve_provider_client: anthropic requested but no Anthropic credentials found")
                 return None, None
             final_model = _normalize_resolved_model(model or default_model, provider)
-            return (_to_async_client(client, final_model) if async_mode else (client, final_model))
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode else (client, final_model))
 
         creds = resolve_api_key_provider_credentials(provider)
         api_key = str(creds.get("api_key", "")).strip()
+        # Honour an explicit api_key override (e.g. from a fallback_model entry
+        # or a custom_providers entry) so callers that pass an explicit
+        # credential can authenticate against endpoints where no built-in
+        # credential is registered for this provider alias.
+        if explicit_api_key:
+            api_key = explicit_api_key.strip() or api_key
         if not api_key:
             tried_sources = list(pconfig.api_key_env_vars)
             if provider == "copilot":
@@ -1968,11 +2831,15 @@ def resolve_provider_client(
                          provider, ", ".join(tried_sources))
             return None, None
 
-        base_url = _to_openai_base_url(
-            str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
-        )
+        raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
+        base_url = _to_openai_base_url(raw_base_url)
+        # Honour an explicit base_url override from the caller — used when a
+        # fallback_model entry (or custom_providers lookup) routes through a
+        # built-in provider name but targets a user-specified endpoint.
+        if explicit_base_url:
+            base_url = _to_openai_base_url(explicit_base_url.strip().rstrip("/"))
 
-        default_model = _API_KEY_PROVIDER_AUX_MODELS.get(provider, "")
+        default_model = _get_aux_model_for_provider(provider)
         final_model = _normalize_resolved_model(model or default_model, provider)
 
         if provider == "gemini":
@@ -1981,7 +2848,7 @@ def resolve_provider_client(
             if is_native_gemini_base_url(base_url):
                 client = GeminiNativeClient(api_key=api_key, base_url=base_url)
                 logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
-                return (_to_async_client(client, final_model) if async_mode
+                return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                         else (client, final_model))
 
         # Provider-specific headers
@@ -1989,9 +2856,23 @@ def resolve_provider_client(
         if base_url_host_matches(base_url, "api.kimi.com"):
             headers["User-Agent"] = "claude-code/0.1.0"
         elif base_url_host_matches(base_url, "api.githubcopilot.com"):
-            from hermes_cli.models import copilot_default_headers
+            from hermes_cli.copilot_auth import copilot_request_headers
 
-            headers.update(copilot_default_headers())
+            headers.update(copilot_request_headers(
+                is_agent_turn=True, is_vision=is_vision
+            ))
+        else:
+            # Fall back to profile.default_headers for providers that declare
+            # client-level attribution headers on their profile (e.g. GMI
+            # User-Agent for traffic identification, Vercel AI Gateway
+            # Referer/Title for analytics).
+            try:
+                from providers import get_provider_profile as _gpf_main
+                _ph_main = _gpf_main(provider)
+                if _ph_main and _ph_main.default_headers:
+                    headers.update(_ph_main.default_headers)
+            except Exception:
+                pass
         client = OpenAI(api_key=api_key, base_url=base_url,
                         **({"default_headers": headers} if headers else {}))
 
@@ -2013,16 +2894,24 @@ def resolve_provider_client(
 
         # Honor api_mode for any API-key provider (e.g. direct OpenAI with
         # codex-family models).  The copilot-specific wrapping above handles
-        # copilot; this covers the general case (#6800).
-        client = _wrap_if_needed(client, final_model, base_url)
+        # copilot; this covers the general case (#6800).  Also rewraps
+        # Anthropic-wire endpoints (Kimi Coding Plan api.kimi.com/coding,
+        # /anthropic-suffixed gateways) so named providers like kimi-coding
+        # land on the right transport without needing per-provider branches.
+        client = _wrap_if_needed(client, final_model, raw_base_url, api_key)
 
         logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
-        return (_to_async_client(client, final_model) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
     if pconfig.auth_type == "external_process":
         creds = resolve_external_process_provider_credentials(provider)
-        final_model = _normalize_resolved_model(model or _read_main_model(), provider)
+        final_model = _normalize_resolved_model(
+            model
+            or (main_runtime.get("model") if main_runtime else None)
+            or _read_main_model(),
+            provider,
+        )
         if provider == "copilot-acp":
             api_key = str(creds.get("api_key", "")).strip()
             base_url = str(creds.get("base_url", "")).strip()
@@ -2049,7 +2938,7 @@ def resolve_provider_client(
                 args=args,
             )
             logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
-            return (_to_async_client(client, final_model) if async_mode
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                     else (client, final_model))
         logger.warning("resolve_provider_client: external-process provider %s not "
                        "directly supported", provider)
@@ -2085,7 +2974,7 @@ def resolve_provider_client(
             base_url=f"https://bedrock-runtime.{region}.amazonaws.com",
         )
         logger.debug("resolve_provider_client: bedrock (%s, %s)", final_model, region)
-        return (_to_async_client(client, final_model) if async_mode
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
     elif pconfig.auth_type in ("oauth_device_code", "oauth_external"):
@@ -2160,14 +3049,22 @@ def _normalize_vision_provider(provider: Optional[str]) -> str:
     return _normalize_aux_provider(provider)
 
 
-def _resolve_strict_vision_backend(provider: str) -> Tuple[Optional[Any], Optional[str]]:
+def _resolve_strict_vision_backend(
+    provider: str,
+    model: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     provider = _normalize_vision_provider(provider)
+    if provider == "copilot":
+        return resolve_provider_client("copilot", model, is_vision=True)
     if provider == "openrouter":
         return _try_openrouter()
     if provider == "nous":
         return _try_nous(vision=True)
     if provider == "openai-codex":
-        return _try_codex()
+        # Route through resolve_provider_client so the caller's explicit
+        # model is used.  There is no safe default Codex model (shifting
+        # allow-list); callers must specify via auxiliary.<task>.model.
+        return resolve_provider_client("openai-codex", model, is_vision=True)
     if provider == "anthropic":
         return _try_anthropic()
     if provider == "custom":
@@ -2229,13 +3126,16 @@ def resolve_vision_provider_client(
             return resolved_provider, None, None
         final_model = resolved_model or default_model
         if async_mode:
-            async_client, async_model = _to_async_client(sync_client, final_model)
+            async_client, async_model = _to_async_client(sync_client, final_model, is_vision=True)
             return resolved_provider, async_client, async_model
         return resolved_provider, sync_client, final_model
 
     if resolved_base_url:
+        provider_for_base_override = (
+            requested if requested and requested not in ("", "auto") else "custom"
+        )
         client, final_model = resolve_provider_client(
-            "custom",
+            provider_for_base_override,
             model=resolved_model,
             async_mode=async_mode,
             explicit_base_url=resolved_base_url,
@@ -2243,8 +3143,8 @@ def resolve_vision_provider_client(
             api_mode=resolved_api_mode,
         )
         if client is None:
-            return "custom", None, None
-        return "custom", client, final_model
+            return provider_for_base_override, None, None
+        return provider_for_base_override, client, final_model
 
     if requested == "auto":
         # Vision auto-detection order:
@@ -2261,19 +3161,35 @@ def resolve_vision_provider_client(
         main_provider = _read_main_provider()
         main_model = _read_main_model()
         if main_provider and main_provider not in ("auto", ""):
+            vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
             if main_provider == "nous":
-                sync_client, default_model = _resolve_strict_vision_backend(main_provider)
+                sync_client, default_model = _resolve_strict_vision_backend(
+                    main_provider, vision_model
+                )
                 if sync_client is not None:
                     logger.info(
                         "Vision auto-detect: using main provider %s (%s)",
                         main_provider, default_model or resolved_model or main_model,
                     )
                     return _finalize(main_provider, sync_client, default_model)
+            elif main_provider in _PROVIDERS_WITHOUT_VISION:
+                # Kimi Coding Plan's /coding endpoint (Anthropic Messages wire)
+                # does not accept image input — Kimi's own docs say "Current
+                # model does not support image input, switch to a model with
+                # image_in capability" and vision lives on the separate Kimi
+                # Platform (api.moonshot.ai). Skip the main provider and fall
+                # through to the aggregator chain instead of returning a
+                # client that will 404 on every vision request (#17076).
+                logger.debug(
+                    "Vision auto-detect: skipping main provider %s (no "
+                    "vision support) — falling through to aggregator chain",
+                    main_provider,
+                )
             else:
-                vision_model = _PROVIDER_VISION_MODELS.get(main_provider, main_model)
                 rpc_client, rpc_model = resolve_provider_client(
                     main_provider, vision_model,
-                    api_mode=resolved_api_mode)
+                    api_mode=resolved_api_mode,
+                    is_vision=True)
                 if rpc_client is not None:
                     logger.info(
                         "Vision auto-detect: using main provider %s (%s)",
@@ -2295,11 +3211,41 @@ def resolve_vision_provider_client(
         return None, None, None
 
     if requested in _VISION_AUTO_PROVIDER_ORDER:
-        sync_client, default_model = _resolve_strict_vision_backend(requested)
+        sync_client, default_model = _resolve_strict_vision_backend(
+            requested, resolved_model
+        )
         return _finalize(requested, sync_client, default_model)
 
+    # ZAI vision models must use the OpenAI-compatible endpoint, not the
+    # Anthropic-compatible one (which may be the main-runtime default).
+    # The Anthropic wire rejects max_tokens on multimodal calls (error 1210),
+    # while the OpenAI wire handles it correctly.
+    if requested == "zai" and not resolved_base_url:
+        zai_openai_urls = [
+            "https://open.bigmodel.cn/api/paas/v4",
+            "https://api.z.ai/api/paas/v4",
+        ]
+        for _zai_url in zai_openai_urls:
+            client, final_model = _get_cached_client(
+                requested, resolved_model, async_mode,
+                base_url=_zai_url,
+                api_key=resolved_api_key or None,
+                api_mode="chat_completions",
+                is_vision=True,
+            )
+            if client is not None:
+                return _finalize(requested, client, final_model)
+        # Fallback: try without explicit base_url (old behavior)
+        client, final_model = _get_cached_client(requested, resolved_model, async_mode,
+                                                 api_mode=resolved_api_mode,
+                                                 is_vision=True)
+        if client is None:
+            return requested, None, None
+        return requested, client, final_model
+
     client, final_model = _get_cached_client(requested, resolved_model, async_mode,
-                                             api_mode=resolved_api_mode)
+                                             api_mode=resolved_api_mode,
+                                             is_vision=True)
     if client is None:
         return requested, None, None
     return requested, client, final_model
@@ -2324,10 +3270,11 @@ def auxiliary_max_tokens_param(value: int) -> dict:
     """
     custom_base = _current_custom_base_url()
     or_key = os.getenv("OPENROUTER_API_KEY")
-    # Only use max_completion_tokens for direct OpenAI custom endpoints
+    # Use max_completion_tokens for direct OpenAI-compatible providers that reject
+    # max_tokens on newer GPT-4o/o-series/GPT-5-style models.
     if (not or_key
             and _read_nous_auth() is None
-            and base_url_hostname(custom_base) == "api.openai.com"):
+            and base_url_hostname(custom_base) in {"api.openai.com", "api.githubcopilot.com"}):
         return {"max_completion_tokens": value}
     return {"max_tokens": value}
 
@@ -2363,10 +3310,12 @@ def _client_cache_key(
     api_key: Optional[str] = None,
     api_mode: Optional[str] = None,
     main_runtime: Optional[Dict[str, Any]] = None,
+    is_vision: bool = False,
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
     runtime_key = tuple(runtime.get(field, "") for field in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
-    return (provider, async_mode, base_url or "", api_key or "", api_mode or "", runtime_key)
+    pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
+    return (provider, async_mode, base_url or "", api_key or "", api_mode or "", runtime_key, is_vision, pool_hint)
 
 
 def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
@@ -2392,6 +3341,7 @@ def _refresh_nous_auxiliary_client(
     api_key: Optional[str] = None,
     api_mode: Optional[str] = None,
     main_runtime: Optional[Dict[str, Any]] = None,
+    is_vision: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Refresh Nous runtime creds, rebuild the client, and replace the cache entry."""
     runtime = _resolve_nous_runtime_api(force_refresh=True)
@@ -2409,7 +3359,7 @@ def _refresh_nous_auxiliary_client(
             current_loop = _aio.get_event_loop()
         except RuntimeError:
             pass
-        client, final_model = _to_async_client(sync_client, final_model or "")
+        client, final_model = _to_async_client(sync_client, final_model or "", is_vision=is_vision)
     else:
         client = sync_client
 
@@ -2420,6 +3370,7 @@ def _refresh_nous_auxiliary_client(
         api_key=api_key,
         api_mode=api_mode,
         main_runtime=main_runtime,
+        is_vision=is_vision,
     )
     _store_cached_client(cache_key, client, final_model, bound_loop=current_loop)
     return client, final_model
@@ -2531,12 +3482,19 @@ def _is_openrouter_client(client: Any) -> bool:
     return False
 
 
+def _cached_client_accepts_slash_models(client: Any, cached_default: Optional[str]) -> bool:
+    """Best-effort check for cached clients that accept ``vendor/model`` IDs."""
+    if _is_openrouter_client(client):
+        return True
+    return bool(cached_default and "/" in cached_default)
+
+
 def _compat_model(client: Any, model: Optional[str], cached_default: Optional[str]) -> Optional[str]:
-    """Drop OpenRouter-format model slugs (with '/') for non-OpenRouter clients.
+    """Keep slash-bearing model IDs only for cached clients that support them.
 
     Mirrors the guard in resolve_provider_client() which is skipped on cache hits.
     """
-    if model and "/" in model and not _is_openrouter_client(client):
+    if model and "/" in model and not _cached_client_accepts_slash_models(client, cached_default):
         return cached_default
     return model or cached_default
 
@@ -2549,6 +3507,7 @@ def _get_cached_client(
     api_key: str = None,
     api_mode: str = None,
     main_runtime: Optional[Dict[str, Any]] = None,
+    is_vision: bool = False,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Get or create a cached client for the given provider.
 
@@ -2585,6 +3544,7 @@ def _get_cached_client(
         api_key=api_key,
         api_mode=api_mode,
         main_runtime=main_runtime,
+        is_vision=is_vision,
     )
     with _client_cache_lock:
         if cache_key in _client_cache:
@@ -2616,6 +3576,7 @@ def _get_cached_client(
         explicit_api_key=api_key,
         api_mode=api_mode,
         main_runtime=runtime,
+        is_vision=is_vision,
     )
     if client is not None:
         # For async clients, remember which loop they were created on so we
@@ -2678,8 +3639,14 @@ def _resolve_task_provider_model(
 
     if task:
         # Config.yaml is the primary source for per-task overrides.
-        if cfg_base_url:
+        if cfg_base_url and cfg_api_key:
+            # Both base_url and api_key explicitly set → custom endpoint.
             return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
+        if cfg_base_url and cfg_provider and cfg_provider != "auto":
+            # base_url set without api_key but with a known provider — use
+            # the provider so it can resolve credentials from env vars
+            # (e.g. OPENROUTER_API_KEY) instead of locking into "custom".
+            return cfg_provider, resolved_model, cfg_base_url, None, resolved_api_mode
         if cfg_provider and cfg_provider != "auto":
             return cfg_provider, resolved_model, None, None, resolved_api_mode
 
@@ -2734,7 +3701,7 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
 
 # Providers that use Anthropic-compatible endpoints (via OpenAI SDK wrapper).
 # Their image content blocks must use Anthropic format, not OpenAI format.
-_ANTHROPIC_COMPAT_PROVIDERS = frozenset({"minimax", "minimax-cn"})
+_ANTHROPIC_COMPAT_PROVIDERS = frozenset({"minimax", "minimax-oauth", "minimax-cn"})
 
 
 def _is_anthropic_compat_endpoint(provider: str, base_url: str) -> bool:
@@ -2836,7 +3803,16 @@ def _build_call_kwargs(
     if max_tokens is not None:
         # Codex adapter handles max_tokens internally; OpenRouter/Nous use max_tokens.
         # Direct OpenAI api.openai.com with newer models needs max_completion_tokens.
-        if provider == "custom":
+        # ZAI vision models (glm-4v-flash, glm-4v-plus, etc.) reject max_tokens with
+        # error code 1210 ("API 调用参数有误") on multimodal requests — skip it.
+        _model_lower = (model or "").lower()
+        _skip_max_tokens = (
+            provider == "zai"
+            and ("4v" in _model_lower or "5v" in _model_lower or "-v" in _model_lower)
+        )
+        if _skip_max_tokens:
+            pass  # ZAI vision models do not accept max_tokens
+        elif provider == "custom":
             custom_base = base_url or _current_custom_base_url()
             if base_url_hostname(custom_base) == "api.openai.com":
                 kwargs["max_completion_tokens"] = max_tokens
@@ -2846,7 +3822,26 @@ def _build_call_kwargs(
             kwargs["max_tokens"] = max_tokens
 
     if tools:
-        kwargs["tools"] = tools
+        # Defensive dedup: providers like Google Vertex, Azure, and Bedrock
+        # reject requests with duplicate tool names (HTTP 400).  The upstream
+        # injection paths (run_agent.py) already dedup, but this guard
+        # converts a hard API failure into a warning if an upstream regression
+        # reintroduces duplicates.  See: #18478
+        _seen: set = set()
+        _deduped: list = []
+        for _t in tools:
+            _tname = (_t.get("function") or {}).get("name", "")
+            if _tname and _tname in _seen:
+                logger.warning(
+                    "_build_call_kwargs: duplicate tool name '%s' removed "
+                    "(provider=%s model=%s)",
+                    _tname, provider, model,
+                )
+                continue
+            if _tname:
+                _seen.add(_tname)
+            _deduped.append(_t)
+        kwargs["tools"] = _deduped
 
     # Provider-specific extra_body
     merged_extra = dict(extra_body or {})
@@ -3048,20 +4043,30 @@ def call_llm(
                 kwargs = retry_kwargs
 
         err_str = str(first_err)
+        # ZAI vision models (glm-4v-flash etc.) return error code 1210
+        # ("API 调用参数有误") when max_tokens is passed on multimodal
+        # calls.  The error message does NOT contain "max_tokens" so the
+        # generic retry below never fires.  Detect the ZAI-specific error
+        # and strip max_tokens before retrying.
+        _is_zai_param_error = (
+            "1210" in err_str
+            and "bigmodel" in str(getattr(client, "base_url", ""))
+        )
         if max_tokens is not None and (
             "max_tokens" in err_str
             or "unsupported_parameter" in err_str
             or _is_unsupported_parameter_error(first_err, "max_tokens")
+            or _is_zai_param_error
         ):
             kwargs.pop("max_tokens", None)
-            kwargs["max_completion_tokens"] = max_tokens
+            kwargs.pop("max_completion_tokens", None)
             try:
                 return _validate_llm_response(
                     client.chat.completions.create(**kwargs), task)
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
+                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
                     raise
                 first_err = retry_err
 
@@ -3079,6 +4084,7 @@ def call_llm(
                 api_key=resolved_api_key,
                 api_mode=resolved_api_mode,
                 main_runtime=main_runtime,
+                is_vision=(task == "vision"),
             )
             if refreshed_client is not None:
                 logger.info("Auxiliary %s: refreshed Nous runtime credentials after 401, retrying",
@@ -3097,39 +4103,56 @@ def call_llm(
                     "Auxiliary %s: refreshed %s credentials after auth error, retrying",
                     task or "call", resolved_provider,
                 )
-                retry_client, retry_model = (
-                    resolve_vision_provider_client(
-                        provider=resolved_provider,
-                        model=final_model,
-                        async_mode=False,
-                    )[1:]
-                    if task == "vision"
-                    else _get_cached_client(
-                        resolved_provider,
-                        resolved_model,
-                        base_url=resolved_base_url,
-                        api_key=resolved_api_key,
-                        api_mode=resolved_api_mode,
-                        main_runtime=main_runtime,
-                    )
+                return _retry_same_provider_sync(
+                    task=task,
+                    resolved_provider=resolved_provider,
+                    resolved_model=resolved_model,
+                    resolved_base_url=resolved_base_url,
+                    resolved_api_key=resolved_api_key,
+                    resolved_api_mode=resolved_api_mode,
+                    main_runtime=main_runtime,
+                    final_model=final_model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
                 )
-                if retry_client is not None:
-                    retry_kwargs = _build_call_kwargs(
-                        resolved_provider,
-                        retry_model or final_model,
-                        messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        tools=tools,
-                        timeout=effective_timeout,
-                        extra_body=effective_extra_body,
-                        base_url=resolved_base_url,
-                    )
-                    _retry_base = str(getattr(retry_client, "base_url", "") or "")
-                    if _is_anthropic_compat_endpoint(resolved_provider, _retry_base):
-                        retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+
+        # ── Same-provider credential-pool recovery ─────────────────────
+        pool_provider = _recoverable_pool_provider(resolved_provider, client)
+        if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
+            recovery_err = first_err
+            if _is_rate_limit_error(first_err):
+                try:
                     return _validate_llm_response(
-                        retry_client.chat.completions.create(**retry_kwargs), task)
+                        client.chat.completions.create(**kwargs), task)
+                except Exception as retry_err:
+                    if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
+                        raise
+                    recovery_err = retry_err
+            if _recover_provider_pool(pool_provider, recovery_err):
+                logger.info(
+                    "Auxiliary %s: recovered %s via credential-pool rotation after %s",
+                    task or "call", pool_provider, type(recovery_err).__name__,
+                )
+                return _retry_same_provider_sync(
+                    task=task,
+                    resolved_provider=resolved_provider,
+                    resolved_model=resolved_model,
+                    resolved_base_url=resolved_base_url,
+                    resolved_api_key=resolved_api_key,
+                    resolved_api_mode=resolved_api_mode,
+                    main_runtime=main_runtime,
+                    final_model=final_model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                )
 
         # ── Payment / credit exhaustion fallback ──────────────────────
         # When the resolved provider returns 402 or a credit-related error,
@@ -3143,13 +4166,27 @@ def call_llm(
         # Codex/OAuth tokens that authenticate but whose endpoint is down,
         # and providers the user never configured that got picked up by
         # the auto-detection chain.
-        should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
+        #
+        # ── Rate-limit fallback (#13579) ─────────────────────────────
+        # When the provider returns a 429 rate-limit (not billing), fall
+        # back to an alternative provider instead of exhausting retries
+        # against the same rate-limited endpoint.
+        should_fallback = (
+            _is_payment_error(first_err)
+            or _is_connection_error(first_err)
+            or _is_rate_limit_error(first_err)
+        )
         # Only try alternative providers when the user didn't explicitly
         # configure this task's provider.  Explicit provider = hard constraint;
         # auto (the default) = best-effort fallback chain.  (#7559)
         is_auto = resolved_provider in ("auto", "", None)
         if should_fallback and is_auto:
-            reason = "payment error" if _is_payment_error(first_err) else "connection error"
+            if _is_payment_error(first_err):
+                reason = "payment error"
+            elif _is_rate_limit_error(first_err):
+                reason = "rate limit"
+            else:
+                reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
             fb_client, fb_model, fb_label = _try_payment_fallback(
@@ -3339,20 +4376,30 @@ async def async_call_llm(
                 kwargs = retry_kwargs
 
         err_str = str(first_err)
+        # ZAI vision models (glm-4v-flash etc.) return error code 1210
+        # ("API 调用参数有误") when max_tokens is passed on multimodal
+        # calls.  The error message does NOT contain "max_tokens" so the
+        # generic retry below never fires.  Detect the ZAI-specific error
+        # and strip max_tokens before retrying.
+        _is_zai_param_error = (
+            "1210" in err_str
+            and "bigmodel" in str(getattr(client, "base_url", ""))
+        )
         if max_tokens is not None and (
             "max_tokens" in err_str
             or "unsupported_parameter" in err_str
             or _is_unsupported_parameter_error(first_err, "max_tokens")
+            or _is_zai_param_error
         ):
             kwargs.pop("max_tokens", None)
-            kwargs["max_completion_tokens"] = max_tokens
+            kwargs.pop("max_completion_tokens", None)
             try:
                 return _validate_llm_response(
                     await client.chat.completions.create(**kwargs), task)
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
-                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err)):
+                if not (_is_payment_error(retry_err) or _is_connection_error(retry_err) or _is_rate_limit_error(retry_err)):
                     raise
                 first_err = retry_err
 
@@ -3369,6 +4416,7 @@ async def async_call_llm(
                 base_url=resolved_base_url,
                 api_key=resolved_api_key,
                 api_mode=resolved_api_mode,
+                is_vision=(task == "vision"),
             )
             if refreshed_client is not None:
                 logger.info("Auxiliary %s (async): refreshed Nous runtime credentials after 401, retrying",
@@ -3387,44 +4435,69 @@ async def async_call_llm(
                     "Auxiliary %s (async): refreshed %s credentials after auth error, retrying",
                     task or "call", resolved_provider,
                 )
-                if task == "vision":
-                    _, retry_client, retry_model = resolve_vision_provider_client(
-                        provider=resolved_provider,
-                        model=final_model,
-                        async_mode=True,
-                    )
-                else:
-                    retry_client, retry_model = _get_cached_client(
-                        resolved_provider,
-                        resolved_model,
-                        async_mode=True,
-                        base_url=resolved_base_url,
-                        api_key=resolved_api_key,
-                        api_mode=resolved_api_mode,
-                    )
-                if retry_client is not None:
-                    retry_kwargs = _build_call_kwargs(
-                        resolved_provider,
-                        retry_model or final_model,
-                        messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        tools=tools,
-                        timeout=effective_timeout,
-                        extra_body=effective_extra_body,
-                        base_url=resolved_base_url,
-                    )
-                    _retry_base = str(getattr(retry_client, "base_url", "") or "")
-                    if _is_anthropic_compat_endpoint(resolved_provider, _retry_base):
-                        retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
-                    return _validate_llm_response(
-                        await retry_client.chat.completions.create(**retry_kwargs), task)
+                return await _retry_same_provider_async(
+                    task=task,
+                    resolved_provider=resolved_provider,
+                    resolved_model=resolved_model,
+                    resolved_base_url=resolved_base_url,
+                    resolved_api_key=resolved_api_key,
+                    resolved_api_mode=resolved_api_mode,
+                    final_model=final_model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                )
 
-        # ── Payment / connection fallback (mirrors sync call_llm) ─────
-        should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
+        # ── Same-provider credential-pool recovery (mirrors sync) ─────
+        pool_provider = _recoverable_pool_provider(resolved_provider, client)
+        if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
+            recovery_err = first_err
+            if _is_rate_limit_error(first_err):
+                try:
+                    return _validate_llm_response(
+                        await client.chat.completions.create(**kwargs), task)
+                except Exception as retry_err:
+                    if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
+                        raise
+                    recovery_err = retry_err
+            if _recover_provider_pool(pool_provider, recovery_err):
+                logger.info(
+                    "Auxiliary %s (async): recovered %s via credential-pool rotation after %s",
+                    task or "call", pool_provider, type(recovery_err).__name__,
+                )
+                return await _retry_same_provider_async(
+                    task=task,
+                    resolved_provider=resolved_provider,
+                    resolved_model=resolved_model,
+                    resolved_base_url=resolved_base_url,
+                    resolved_api_key=resolved_api_key,
+                    resolved_api_mode=resolved_api_mode,
+                    final_model=final_model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                )
+
+        # ── Payment / connection / rate-limit fallback (mirrors sync call_llm) ──
+        should_fallback = (
+            _is_payment_error(first_err)
+            or _is_connection_error(first_err)
+            or _is_rate_limit_error(first_err)
+        )
         is_auto = resolved_provider in ("auto", "", None)
         if should_fallback and is_auto:
-            reason = "payment error" if _is_payment_error(first_err) else "connection error"
+            if _is_payment_error(first_err):
+                reason = "payment error"
+            elif _is_rate_limit_error(first_err):
+                reason = "rate limit"
+            else:
+                reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
             fb_client, fb_model, fb_label = _try_payment_fallback(
@@ -3437,7 +4510,9 @@ async def async_call_llm(
                     extra_body=effective_extra_body,
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
                 # Convert sync fallback client to async
-                async_fb, async_fb_model = _to_async_client(fb_client, fb_model or "")
+                async_fb, async_fb_model = _to_async_client(
+                    fb_client, fb_model or "", is_vision=(task == "vision")
+                )
                 if async_fb_model and async_fb_model != fb_kwargs.get("model"):
                     fb_kwargs["model"] = async_fb_model
                 return _validate_llm_response(
