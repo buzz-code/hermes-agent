@@ -48,7 +48,16 @@ Pick the row that matches your goal:
 
 ## 1. Install Hermes Agent
 
-Run the one-line installer:
+**Option A — pip (simplest):**
+
+```bash
+pip install hermes-agent
+hermes postinstall     # optional: installs Node.js, browser, ripgrep, ffmpeg + runs setup
+```
+
+PyPI releases track tagged versions (major/minor releases), not every commit on `main`. For bleeding-edge, use Option B.
+
+**Option B — git installer (tracks main branch):**
 
 ```bash
 # Linux / macOS / WSL2 / Android (Termux)
@@ -78,6 +87,16 @@ The single most important setup step. Use `hermes model` to walk through the cho
 ```bash
 hermes model
 ```
+
+:::tip Easiest path: Nous Portal
+One subscription covers 300+ models plus the [Tool Gateway](../user-guide/features/tool-gateway.md) (web search, image generation, TTS, cloud browser). On a fresh install:
+
+```bash
+hermes setup --portal
+```
+
+That logs you in, sets Nous as your provider, and turns on the Tool Gateway in one command.
+:::
 
 Good defaults:
 

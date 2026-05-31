@@ -5,6 +5,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import logging
 import os
 import shutil
 import signal
@@ -38,6 +39,7 @@ from hermes_cli.setup import (
 )
 from hermes_cli.colors import Colors, color
 
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Process Management (for manual gateway runs)
@@ -1194,7 +1196,7 @@ def _systemd_operational(system: bool = False) -> bool:
         )
         # "running", "degraded", "starting" all mean systemd is PID 1
         status = result.stdout.strip().lower()
-        return status in ("running", "degraded", "starting", "initializing")
+        return status in {"running", "degraded", "starting", "initializing"}
     except (RuntimeError, subprocess.TimeoutExpired, OSError):
         return False
 
@@ -1837,7 +1839,7 @@ def prompt_linux_gateway_install_scope() -> str | None:
     return {0: "user", 1: "system", 2: None}[choice]
 
 
-def install_linux_gateway_from_setup(force: bool = False) -> tuple[str | None, bool]:
+def install_linux_gateway_from_setup(force: bool = False, enable_on_startup: bool = True) -> tuple[str | None, bool]:
     scope = prompt_linux_gateway_install_scope()
     if scope is None:
         return None, False
@@ -1861,10 +1863,10 @@ def install_linux_gateway_from_setup(force: bool = False) -> tuple[str | None, b
                     break
                 print_error("  Enter a username.")
 
-        systemd_install(force=force, system=True, run_as_user=run_as_user)
+        systemd_install(force=force, system=True, run_as_user=run_as_user, enable_on_startup=enable_on_startup)
         return scope, True
 
-    systemd_install(force=force, system=False)
+    systemd_install(force=force, system=False, enable_on_startup=enable_on_startup)
     return scope, True
 
 
@@ -2103,15 +2105,47 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
         return str(current_hermes)
 
 
+def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
+    """Build PATH directory list for service units, excluding non-existent dirs."""
+    if project_root is None:
+        project_root = PROJECT_ROOT
+
+    def _is_dir(path: Path) -> bool:
+        try:
+            return path.is_dir()
+        except OSError:
+            return False
+
+    candidates = []
+
+    venv_bin = project_root / "venv" / "bin"
+    if _is_dir(venv_bin):
+        candidates.append(str(venv_bin))
+    elif sys.prefix != sys.base_prefix:
+        candidates.append(str(Path(sys.prefix) / "bin"))
+
+    node_bin = project_root / "node_modules" / ".bin"
+    if _is_dir(node_bin):
+        candidates.append(str(node_bin))
+
+    hermes_home = get_hermes_home()
+    hermes_node = hermes_home / "node" / "bin"
+    if _is_dir(hermes_node):
+        candidates.append(str(hermes_node))
+    hermes_nm = hermes_home / "node_modules" / ".bin"
+    if _is_dir(hermes_nm):
+        candidates.append(str(hermes_nm))
+
+    return candidates
+
+
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
     python_path = get_python_path()
     working_dir = str(PROJECT_ROOT)
     detected_venv = _detect_venv_dir()
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
-    venv_bin = str(detected_venv / "bin") if detected_venv else str(PROJECT_ROOT / "venv" / "bin")
-    node_bin = str(PROJECT_ROOT / "node_modules" / ".bin")
 
-    path_entries = [venv_bin, node_bin]
+    path_entries = _build_service_path_dirs()
     resolved_node = shutil.which("node")
     if resolved_node:
         resolved_node_dir = str(Path(resolved_node).resolve().parent)
@@ -2138,8 +2172,6 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         python_path = _remap_path_for_user(python_path, home_dir)
         working_dir = _remap_path_for_user(working_dir, home_dir)
         venv_dir = _remap_path_for_user(venv_dir, home_dir)
-        venv_bin = _remap_path_for_user(venv_bin, home_dir)
-        node_bin = _remap_path_for_user(node_bin, home_dir)
         path_entries = [_remap_path_for_user(p, home_dir) for p in path_entries]
         path_entries.extend(_build_user_local_paths(Path(home_dir), path_entries))
         path_entries.extend(_build_wsl_interop_paths(path_entries))
@@ -2164,7 +2196,7 @@ Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=always
-RestartSec=60
+RestartSec=5
 RestartMaxDelaySec=300
 RestartSteps=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -2199,7 +2231,7 @@ Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
 Restart=always
-RestartSec=60
+RestartSec=5
 RestartMaxDelaySec=300
 RestartSteps=5
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
@@ -2405,7 +2437,12 @@ def _get_restart_drain_timeout() -> float:
     return parse_restart_drain_timeout(raw)
 
 
-def systemd_install(force: bool = False, system: bool = False, run_as_user: str | None = None):
+def systemd_install(
+    force: bool = False,
+    system: bool = False,
+    run_as_user: str | None = None,
+    enable_on_startup: bool = True,
+):
     if system:
         _require_root_for_system_service("install")
 
@@ -2429,7 +2466,8 @@ def systemd_install(force: bool = False, system: bool = False, run_as_user: str 
         if not systemd_unit_is_current(system=system):
             print(f"↻ Repairing outdated {_service_scope_label(system)} systemd service at: {unit_path}")
             refresh_systemd_unit_if_needed(system=system)
-            _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
+            if enable_on_startup:
+                _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
             print(f"✓ {_service_scope_label(system).capitalize()} service definition updated")
             return
         print(f"Service already installed at: {unit_path}")
@@ -2441,10 +2479,12 @@ def systemd_install(force: bool = False, system: bool = False, run_as_user: str 
     unit_path.write_text(generate_systemd_unit(system=system, run_as_user=run_as_user), encoding="utf-8")
 
     _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
-    _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
+    if enable_on_startup:
+        _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
 
     print()
-    print(f"✓ {_service_scope_label(system).capitalize()} service installed and enabled!")
+    enable_label = "installed and enabled" if enable_on_startup else "installed"
+    print(f"✓ {_service_scope_label(system).capitalize()} service {enable_label}!")
     print()
     print("Next steps:")
     print(f"  {'sudo ' if system else ''}hermes gateway start{scope_flag}              # Start the service")
@@ -2754,12 +2794,10 @@ def generate_launchd_plist() -> str:
     # the systemd unit), then capture the user's full shell PATH so every
     # user-installed tool (node, ffmpeg, …) is reachable.
     detected_venv = _detect_venv_dir()
-    venv_bin = str(detected_venv / "bin") if detected_venv else str(PROJECT_ROOT / "venv" / "bin")
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
-    node_bin = str(PROJECT_ROOT / "node_modules" / ".bin")
     # Resolve the directory containing the node binary (e.g. Homebrew, nvm)
     # so it's explicitly in PATH even if the user's shell PATH changes later.
-    priority_dirs = [venv_bin, node_bin]
+    priority_dirs = _build_service_path_dirs()
     resolved_node = shutil.which("node")
     if resolved_node:
         resolved_node_dir = str(Path(resolved_node).resolve().parent)
@@ -2915,7 +2953,7 @@ def launchd_start():
     try:
         subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
     except subprocess.CalledProcessError as e:
-        if e.returncode not in (3, 113):
+        if e.returncode not in {3, 113}:
             raise
         print("↻ launchd job was unloaded; reloading service definition")
         subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
@@ -2939,7 +2977,7 @@ def launchd_stop():
     try:
         subprocess.run(["launchctl", "bootout", target], check=True, timeout=90)
     except subprocess.CalledProcessError as e:
-        if e.returncode in (3, 113):
+        if e.returncode in {3, 113}:
             pass  # Already unloaded — nothing to stop.
         else:
             raise
@@ -3011,7 +3049,7 @@ def launchd_restart():
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
     except subprocess.CalledProcessError as e:
-        if e.returncode not in (3, 113):
+        if e.returncode not in {3, 113}:
             raise
         # Job not loaded — bootstrap and start fresh
         print("↻ launchd job was unloaded; reloading")
@@ -3289,34 +3327,9 @@ _PLATFORMS = [
              "help": "For DMs, this is your user ID. You can set it later by typing /set-home in chat."},
         ],
     },
-    {
-        "key": "discord",
-        "label": "Discord",
-        "emoji": "💬",
-        "token_var": "DISCORD_BOT_TOKEN",
-        "setup_instructions": [
-            "1. Go to https://discord.com/developers/applications → New Application",
-            "2. Go to Bot → Reset Token → copy the bot token",
-            "3. Enable: Bot → Privileged Gateway Intents → Message Content Intent",
-            "4. Invite the bot to your server:",
-            "   OAuth2 → URL Generator → check BOTH scopes:",
-            "     - bot",
-            "     - applications.commands  (required for slash commands!)",
-            "   Bot Permissions: Send Messages, Read Message History, Attach Files",
-            "   Copy the URL and open it in your browser to invite.",
-            "5. Get your user ID: enable Developer Mode in Discord settings,",
-            "   then right-click your name → Copy ID",
-        ],
-        "vars": [
-            {"name": "DISCORD_BOT_TOKEN", "prompt": "Bot token", "password": True,
-             "help": "Paste the token from step 2 above."},
-            {"name": "DISCORD_ALLOWED_USERS", "prompt": "Allowed user IDs or usernames (comma-separated)", "password": False,
-             "is_allowlist": True,
-             "help": "Paste your user ID from step 5 above."},
-            {"name": "DISCORD_HOME_CHANNEL", "prompt": "Home channel ID (for cron/notification delivery, or empty to set later with /set-home)", "password": False,
-             "help": "Right-click a channel → Copy Channel ID (requires Developer Mode)."},
-        ],
-    },
+    # Discord moved to plugins/platforms/discord/ — its setup metadata is
+    # discovered dynamically via _all_platforms() from the platform registry
+    # entry registered by plugins/platforms/discord/adapter.py::register().
     {
         "key": "slack",
         "label": "Slack",
@@ -3658,6 +3671,15 @@ def _all_platforms() -> list[dict]:
     ``hermes setup gateway`` without needing the gateway to be running.
     Built-ins keep their dict shape; plugin entries are adapted to the same
     shape with ``_registry_entry`` holding the source.
+
+    Platform-specific gating: some platforms can't be configured on
+    every host. Currently:
+      - Matrix is hidden on Windows. The [matrix] extra pulls
+        ``mautrix[encryption]`` -> ``python-olm``, which has no Windows
+        wheel and needs ``make`` + libolm to build from sdist. There's
+        no native Windows path that works, so we don't offer it in the
+        picker. Users who want Matrix on Windows can run hermes under
+        WSL.
     """
     # Populate the registry so plugin platforms are visible. Idempotent.
     # Bundled platform plugins (``kind: platform``) auto-load unconditionally,
@@ -3671,6 +3693,11 @@ def _all_platforms() -> list[dict]:
         logger.debug("plugin discovery failed during platform enumeration: %s", e)
 
     platforms = [dict(p) for p in _PLATFORMS]
+
+    # Drop platforms that can't function on this host. See docstring.
+    if sys.platform == "win32":
+        platforms = [p for p in platforms if p.get("key") != "matrix"]
+
     by_key = {p["key"]: p for p in platforms}
 
     try:
@@ -3710,7 +3737,12 @@ def _platform_status(platform: dict) -> str:
                 configured = bool(entry.is_connected(synthetic))
             except Exception:
                 configured = False
-        if not configured:
+        else:
+            # No is_connected hook — fall back to check_fn as a coarse
+            # "are deps present" gate. Don't fall back when is_connected
+            # is defined and returned False; that would let "SDK is
+            # installed" override "no token configured" and incorrectly
+            # report the platform as ready.
             try:
                 configured = bool(entry.check_fn())
             except Exception:
@@ -3749,7 +3781,7 @@ def _platform_status(platform: dict) -> str:
         password = get_env_value("MATRIX_PASSWORD")
         if (val or password) and homeserver:
             e2ee = get_env_value("MATRIX_ENCRYPTION")
-            suffix = " + E2EE" if e2ee and e2ee.lower() in ("true", "1", "yes") else ""
+            suffix = " + E2EE" if e2ee and e2ee.lower() in {"true", "1", "yes"} else ""
             return f"configured{suffix}"
         if val or password or homeserver:
             return "partially configured"
@@ -4695,7 +4727,9 @@ def _builtin_setup_fn(key: str):
     from hermes_cli import setup as _s
     return {
         "telegram": _s._setup_telegram,
-        "discord": _s._setup_discord,
+        # discord moved into the plugin: setup_fn is registered by
+        # plugins/platforms/discord/adapter.py::register() and dispatched
+        # via the plugin path in _configure_platform().
         "slack": _s._setup_slack,
         "matrix": _s._setup_matrix,
         "mattermost": _s._setup_mattermost,
@@ -4903,31 +4937,37 @@ def gateway_setup():
                 else:
                     platform_name = "Scheduled Task"
                 wsl_note = " (note: services may not survive WSL restarts)" if is_wsl() else ""
-                if prompt_yes_no(f"  Install the gateway as a {platform_name} service?{wsl_note} (runs in background, starts on boot)", True):
+                start_now = prompt_yes_no("  Start the gateway now?", True)
+                start_on_login = prompt_yes_no(
+                    f"  Start the gateway automatically on login/boot as a {platform_name} service?{wsl_note}",
+                    True,
+                )
+                if start_now or start_on_login:
                     try:
                         installed_scope = None
                         did_install = False
-                        started_inline = False
                         if supports_systemd_services():
-                            installed_scope, did_install = install_linux_gateway_from_setup(force=False)
+                            installed_scope, did_install = install_linux_gateway_from_setup(
+                                force=False,
+                                enable_on_startup=start_on_login,
+                            )
                         elif is_macos():
                             launchd_install(force=False)
                             did_install = True
                         else:
-                            # gateway_windows.install() registers the Scheduled
-                            # Task AND starts it (schtasks /Run or direct-spawn
-                            # fallback), so no separate start prompt is needed.
                             from hermes_cli import gateway_windows
                             gateway_windows.install(force=False)
                             did_install = True
-                            started_inline = True
                         print()
-                        if did_install and not started_inline and prompt_yes_no("  Start the service now?", True):
+                        if did_install and start_now:
                             try:
                                 if supports_systemd_services():
                                     systemd_start(system=installed_scope == "system")
-                                else:
+                                elif is_macos():
                                     launchd_start()
+                                elif is_windows():
+                                    from hermes_cli import gateway_windows
+                                    gateway_windows.start()
                             except UserSystemdUnavailableError as e:
                                 print_error("  Start failed — user systemd not reachable:")
                                 for line in str(e).splitlines():
@@ -4938,6 +4978,7 @@ def gateway_setup():
                         print_error(f"  Install failed: {e}")
                         print_info("  You can try manually: hermes gateway install")
                 else:
+                    print_info("  Skipped start and auto-start setup.")
                     print_info("  You can install later: hermes gateway install")
                     if supports_systemd_services():
                         print_info("  Or as a boot-time service: sudo hermes gateway install --system")
@@ -4947,15 +4988,14 @@ def gateway_setup():
                 print_info("  Run in foreground: hermes gateway run")
                 print_info("  For persistence:   tmux new -s hermes 'hermes gateway run'")
                 print_info("  To enable systemd: add systemd=true to /etc/wsl.conf, then 'wsl --shutdown'")
+            elif is_termux():
+                from hermes_constants import display_hermes_home as _dhh
+                print_info("  Termux does not use systemd/launchd services.")
+                print_info("  Run in foreground: hermes gateway run")
+                print_info(f"  Or start it manually in the background (best effort): nohup hermes gateway run >{_dhh()}/logs/gateway.log 2>&1 &")
             else:
-                if is_termux():
-                    from hermes_constants import display_hermes_home as _dhh
-                    print_info("  Termux does not use systemd/launchd services.")
-                    print_info("  Run in foreground: hermes gateway run")
-                    print_info(f"  Or start it manually in the background (best effort): nohup hermes gateway run >{_dhh()}/logs/gateway.log 2>&1 &")
-                else:
-                    print_info("  Service install not supported on this platform.")
-                    print_info("  Run in foreground: hermes gateway run")
+                print_info("  Service install not supported on this platform.")
+                print_info("  Run in foreground: hermes gateway run")
     else:
         print()
         print_info("No platforms configured. Run 'hermes gateway setup' when ready.")
@@ -5021,12 +5061,26 @@ def _gateway_command_inner(args):
                 print_info("  Consider running in foreground instead: hermes gateway run")
                 print_info("  Or use tmux/screen for persistence: tmux new -s hermes 'hermes gateway run'")
                 print()
-            systemd_install(force=force, system=system, run_as_user=run_as_user)
+            start_now = prompt_yes_no("Start the gateway now after installing the service?", True)
+            start_on_login = prompt_yes_no("Start the gateway automatically on login/boot with systemd?", True)
+            systemd_install(
+                force=force,
+                system=system,
+                run_as_user=run_as_user,
+                enable_on_startup=start_on_login,
+            )
+            if start_now:
+                systemd_start(system=system)
         elif is_macos():
             launchd_install(force)
         elif is_windows():
             from hermes_cli import gateway_windows
-            gateway_windows.install(force=force)
+            gateway_windows.install(
+                force=force,
+                start_now=getattr(args, 'start_now', None),
+                start_on_login=getattr(args, 'start_on_login', None),
+                elevated_handoff=getattr(args, 'elevated_handoff', False),
+            )
         elif is_wsl():
             print("WSL detected but systemd is not running.")
             print("Either enable systemd (add systemd=true to /etc/wsl.conf and restart WSL)")
@@ -5232,10 +5286,13 @@ def _gateway_command_inner(args):
                 launchd_start()
             elif is_windows():
                 from hermes_cli import gateway_windows
-                if gateway_windows.is_installed():
-                    gateway_windows.start()
-                else:
-                    run_gateway(verbose=0)
+                # On Windows, even without a registered Scheduled Task / Startup
+                # entry, gateway_windows.start() uses the safe detached
+                # pythonw.exe launcher.  Do not fall back to run_gateway() here:
+                # when invoked from a gateway-hosted agent/tool call, foreground
+                # run_gateway() is tied to the very gateway process we just
+                # stopped and can die before the replacement is stable.
+                gateway_windows.start()
             else:
                 run_gateway(verbose=0)
             return
@@ -5256,13 +5313,19 @@ def _gateway_command_inner(args):
                 pass
         elif is_windows():
             from hermes_cli import gateway_windows
-            if gateway_windows.is_installed():
-                service_configured = True
-                try:
-                    gateway_windows.restart()
-                    service_available = True
-                except (subprocess.CalledProcessError, RuntimeError):
-                    pass
+            # Prefer the Windows-specific restart path: it supports both
+            # registered Scheduled Task / Startup installs and no-service
+            # detached restarts.  In the normal successful Telegram-triggered
+            # restart flow, this avoids the generic foreground run_gateway()
+            # path that can be reaped with the old gateway process.  If the
+            # Windows backend raises, intentionally preserve the existing
+            # generic failure fallback below.
+            service_configured = gateway_windows.is_installed()
+            try:
+                gateway_windows.restart()
+                return
+            except (subprocess.CalledProcessError, RuntimeError, OSError):
+                pass
         
         if not service_available:
             # systemd/launchd restart failed — check if linger is the issue
