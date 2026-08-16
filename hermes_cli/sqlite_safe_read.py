@@ -40,7 +40,7 @@ lifecycle**. ``_live_lock`` is therefore held across three critical sections,
 each of which spans the syscall *and* the registry mutation:
 
 * open + register (:func:`connect_tracked`)
-* unregister + close (:meth:`TrackedConnection.close`)
+* close + unregister (:meth:`TrackedConnection.close`)
 * check + ``open``/``read``/``close`` (:func:`read_header_bytes_preopen`)
 
 Without that, a thread could pass the "no live connection" check, a second
@@ -61,6 +61,7 @@ later probe of the real ``Path`` can ever match.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sqlite3
@@ -153,10 +154,14 @@ class _TrackingMixin:
     def close(self) -> None:  # type: ignore[misc]
         with _live_lock:
             path = getattr(self, "_hermes_tracked_path", None)
+            # Close first; untrack only once the descriptor is actually gone.
+            # Untracking before a failing close (e.g. cross-thread
+            # ProgrammingError) leaves the FD open while the byte-probe
+            # guard thinks nothing is live — see #75629.
+            super().close()  # type: ignore[misc]
             if path is not None:
                 self._hermes_tracked_path = None
                 untrack_connection(path)
-            super().close()  # type: ignore[misc]
 
 
 class TrackedConnection(_TrackingMixin, sqlite3.Connection):
@@ -168,9 +173,11 @@ class TrackedConnection(_TrackingMixin, sqlite3.Connection):
     method every close path must go through — keeps the registry from
     drifting upward and permanently disabling byte-probes.
 
-    The unregister and the real ``close()`` happen together under
+    The real ``close()`` and the unregister happen together under
     ``_live_lock`` so a concurrent probe can never observe "no live
-    connection" while this descriptor is still open.
+    connection" while this descriptor is still open. Unregister runs only
+    after ``close()`` succeeds; a raising close leaves the connection
+    tracked so the byte-probe guard keeps refusing.
 
     Note ``with conn:`` does NOT close a sqlite3 connection (it only commits or
     rolls back), so this hook is not fired spuriously by transaction scopes.
@@ -372,3 +379,37 @@ def read_header_bytes_preopen(
                 return handle.read(length)
         except OSError:
             return None
+
+
+class LiveConnectionError(RuntimeError):
+    """A raw file operation was attempted on a database with live connections."""
+
+
+@contextlib.contextmanager
+def offline_file_access(path: Path | str, *, what: str = "read"):
+    """Hold the connection-lifecycle lock across a raw read of a database file.
+
+    Checking :func:`has_live_connection` and *then* doing the raw I/O is a
+    check/use race: a connection can be opened in the window between the two,
+    and the raw ``close()`` will cancel its POSIX advisory locks — the exact
+    failure class the registry exists to prevent. Any multi-step raw access
+    (copying a database plus its ``-wal``/``-shm``/``-journal`` sidecars,
+    hashing a file, moving a bundle aside) must therefore run *inside* this
+    context manager rather than after a bare check.
+
+    While held, :func:`connect_tracked` blocks, so no new connection can
+    appear mid-copy. Raises :class:`LiveConnectionError` if a connection is
+    already live when the guard is entered.
+
+    The lock is only held for the duration of the raw I/O; it never spans
+    caller work on an open connection, so it does not serialise database use.
+    """
+    with _live_lock:
+        if _key(path) in _live_connections:
+            raise LiveConnectionError(
+                f"Refusing to {what} {path}: a connection to it is still open "
+                "in this process, and raw file access would cancel that "
+                "connection's POSIX advisory locks. Close all database "
+                "handles (stop the gateway/dashboard) and retry."
+            )
+        yield
