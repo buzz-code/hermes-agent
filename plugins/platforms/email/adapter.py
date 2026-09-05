@@ -36,6 +36,7 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email.utils import formatdate
 from email import encoders
+from html import escape as _escape_html
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -358,6 +359,50 @@ def _strip_html(html: str) -> str:
     text = re.sub(r"&gt;", ">", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+# RTL script ranges (Hebrew, Arabic, and presentation forms) — decides
+# whether an outgoing body needs an RTL HTML alternative part.
+_RTL_SCRIPT_RE = re.compile(
+    r"[\u0590-\u05FF\u0600-\u06FF\u0750-\u077F\uFB1D-\uFDFF\uFE70-\uFEFF]"
+)
+
+
+def _rtl_html_body_part(body: str) -> Optional[MIMEText]:
+    """Build a minimal RTL HTML alternative for ``body``.
+
+    Returns ``None`` when the body has no RTL-script text — pure-LTR mail
+    keeps the legacy single plain-text part. The direction lives on the
+    inner ``<div>`` because webmail clients (Gmail) rebuild the document
+    and drop attributes from ``<html>``/``<body>``.
+    """
+    if not body or not _RTL_SCRIPT_RE.search(body):
+        return None
+    html_body = (
+        '<!DOCTYPE html>\n<html lang="he" dir="rtl">\n'
+        '<head><meta charset="utf-8"></head>\n'
+        '<body><div dir="rtl" style="direction:rtl;text-align:right;'
+        'font-family:sans-serif;white-space:pre-wrap">'
+        + _escape_html(body)
+        + "</div></body>\n</html>"
+    )
+    return MIMEText(html_body, "html", "utf-8")
+
+
+def _attach_body(msg: MIMEMultipart, body: str) -> None:
+    """Attach the body as a multipart/alternative group when it contains
+    RTL-script text (plain + RTL HTML), or as a lone plain part otherwise.
+    Clients that render HTML pick the RTL part; plain-text clients are
+    unaffected."""
+    plain = MIMEText(body, "plain", "utf-8")
+    html_part = _rtl_html_body_part(body)
+    if html_part:
+        alt = MIMEMultipart("alternative")
+        alt.attach(plain)
+        alt.attach(html_part)
+        msg.attach(alt)
+    else:
+        msg.attach(plain)
 
 
 def _extract_email_address(raw: str) -> str:
@@ -1214,7 +1259,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
 
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        _attach_body(msg, body)
 
         smtp = self._connect_smtp()
         try:
@@ -1373,7 +1418,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Message-ID"] = msg_id
 
         if body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            _attach_body(msg, body)
 
         for file_path in file_paths:
             p = Path(file_path)
@@ -1457,7 +1502,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Message-ID"] = msg_id
 
         if body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            _attach_body(msg, body)
 
         # Attach file — use proper MIME type for better display in email clients
         p = Path(file_path)
@@ -1539,7 +1584,8 @@ async def _standalone_send(
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        msg = MIMEMultipart()
+        _attach_body(msg, message)
         msg["From"] = address
         msg["To"] = chat_id
         msg["Subject"] = "Hermes Agent"
