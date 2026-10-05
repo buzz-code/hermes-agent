@@ -1025,6 +1025,11 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
         _attach_body(msg, message)
         for key, value in (("From", address), ("To", chat_id), ("Subject", "Hermes Agent"), ("Date", formatdate(localtime=True))):
             msg[key] = value
+        for media_path in media_files or []:
+            try:
+                _attach_file(msg, Path(media_path), Path(media_path).name)
+            except Exception as exc:
+                logger.warning("Email: skipping attachment %s: %s", media_path, exc)
         server = _open_smtp(smtp_host, smtp_port, smtp_security, _tls_context(smtp_tls_verify, smtp_host), smtplib.SMTP, smtplib.SMTP_SSL)
         server.login(address, password)
         server.send_message(msg)

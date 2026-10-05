@@ -669,7 +669,8 @@ _CHUNKED_ROUTES = {
         pc.extra, cid, chunk, media_files=media)),
     "yuanbao": (True, None, lambda p, pc, cid, chunk, media, tid, fd: _send_yuanbao(cid, chunk, media_files=media)),
     "slack": (False, [], _via_adapter_route),
-    "wecom": (True, None, _via_adapter_route)}
+    "wecom": (True, None, _via_adapter_route),
+    "email": (True, None, _via_adapter_route)}
 
 # Text-only senders for built-in platforms (generic path; media is dropped with a
 # warning). Signature: (pconfig, chat_id, chunk, thread_id) -> result.
