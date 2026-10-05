@@ -682,7 +682,7 @@ _TEXT_SENDERS = {
     "qqbot": lambda pc, cid, chunk, tid: _send_qqbot(pc, cid, chunk),
     "yuanbao": lambda pc, cid, chunk, tid: _send_yuanbao(cid, chunk)}
 
-_MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
+_MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp, slack and email"
 
 
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None,
