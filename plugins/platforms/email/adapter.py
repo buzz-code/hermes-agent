@@ -1025,6 +1025,18 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
         _attach_body(msg, message)
         for key, value in (("From", address), ("To", chat_id), ("Subject", "Hermes Agent"), ("Date", formatdate(localtime=True))):
             msg[key] = value
+        for descriptor in media_files or []:
+            # send_message normalizes MEDIA entries to ``(path, is_voice)`` tuples
+            # (BasePlatformAdapter.extract_media); unpack before building the path.
+            # A bare string is still accepted so direct callers keep working.
+            media_path = descriptor[0] if isinstance(descriptor, (list, tuple)) and descriptor else descriptor
+            if not isinstance(media_path, str) or not media_path:
+                logger.warning("Email: skipping invalid attachment descriptor %r", descriptor)
+                continue
+            try:
+                _attach_file(msg, Path(media_path), Path(media_path).name)
+            except Exception as exc:
+                logger.warning("Email: skipping attachment %s: %s", media_path, exc)
         server = _open_smtp(smtp_host, smtp_port, smtp_security, _tls_context(smtp_tls_verify, smtp_host), smtplib.SMTP, smtplib.SMTP_SSL)
         server.login(address, password)
         server.send_message(msg)
