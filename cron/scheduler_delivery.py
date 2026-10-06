@@ -1412,6 +1412,29 @@ def _inchannel_surface_supported(runtime_adapter, platform_name: str) -> bool:
     return bool(getattr(runtime_adapter, "supports_inchannel_continuable", False))
 
 
+def _job_subject(job: dict) -> str:
+    """This job's delivery Subject title, or ``""`` when unset.
+
+    A job may carry its own ``subject``; otherwise the job name is used only when
+    ``cron.subject_from_name`` is enabled (default on), so every job gets a distinct,
+    recognisable title instead of the thread's generic one. Redacted like every other
+    outward string because it lands in a mail header.
+    """
+    subject = _redact_cron_payload(str(job.get("subject") or "").strip(), "job subject")
+    if subject:
+        return subject
+    enabled = True
+    try:
+        configured = (_sched.load_config() or {}).get("cron", {}).get("subject_from_name", True)
+        # Only a real boolean counts; a malformed value (None, "yes") keeps the documented default.
+        enabled = configured if isinstance(configured, bool) else True
+    except Exception:
+        enabled = True
+    if not enabled:
+        return ""
+    return _redact_cron_payload(str(job.get("name") or "").strip(), "job name")
+
+
 def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]:
     """Compute ``(route_thread_id, route_metadata, media_metadata)`` for a live send, ONCE so text
     and media agree. ``telegram:<positive_chat_id>:<numeric_thread_id>`` is ambiguous (private
@@ -1447,9 +1470,16 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         route_metadata = {"job_id": job["id"], "notify": t.notify_delivery}
         if route_thread_id:
             route_metadata["thread_id"] = route_thread_id
-        media_metadata = {"notify": t.notify_delivery}
+        media_metadata: dict = {"notify": t.notify_delivery}
         if thread_id:
             media_metadata["thread_id"] = thread_id
+        # Per-job Subject title (email + other title-carrying platforms). Adapters that have no
+        # such concept ignore the key, so it is always safe to carry. Resolved ONCE so text and
+        # media agree; see _job_subject.
+        subject = _job_subject(job)
+        if subject:
+            route_metadata["subject"] = subject
+            media_metadata["subject"] = subject
 
     # Relay egress needs metadata.scope_id (fail-closed tenant guard; scope cache is COLD after a
     # restart; router stamps HOME only). Origin targets only: a wrong fan-out scope is worse than
@@ -1688,7 +1718,7 @@ def _standalone_send(
         # unstarted, and a wait_for wrapper created out here would be left never awaited.
         return await asyncio.wait_for(_send_to_platform(
             t.platform, t.pconfig, t.chat_id, content, thread_id=t.thread_id,
-            media_files=media_files), timeout=send_timeout)
+            media_files=media_files, subject=_job_subject(job) or None), timeout=send_timeout)
 
     def _warned(msg: str) -> tuple[None, str]:
         logger.warning("Job '%s': %s", job["id"], msg)
