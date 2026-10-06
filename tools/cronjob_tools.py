@@ -619,6 +619,7 @@ def _action_create(a: Dict[str, Any]) -> str:
             reasoning_effort=a["reasoning_effort"],
             pinned=bool(a["pinned"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
+            subject=_normalize_optional_job_value(a["subject"]),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
@@ -772,6 +773,9 @@ def _update_core_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[st
     if a["reasoning_effort"] is not None:
         # CLI-only lane; update_job validates, empty string clears the pin.
         updates["reasoning_effort"] = a["reasoning_effort"]
+    if a["subject"] is not None:
+        # '' clears the override (fall back to the job name), like failure_deliver.
+        updates["subject"] = _normalize_optional_job_value(a["subject"])
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
     # this guard may hold an unsafe pair, and editing an unrelated field must not leave it
     # schedulable. Merging this update over the stored job lets an operator remediate.
@@ -922,6 +926,7 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
+    subject: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
     paused: bool = False,
@@ -1014,6 +1019,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "string",
                 "description": "Optional override target for FAILURE notices only (same grammar as deliver). When set, engine failure/interruption notices go here instead of the deliver target; 'local' suppresses them entirely (state still recorded in cron list/run history). Use for jobs delivering into shared channels where failure noise is unwanted. Omit = failures follow deliver (default). On update, '' clears."
             },
+            "subject": {
+                "type": "string",
+                "description": "Optional exact email Subject line for this job's deliveries (the email adapter keeps its 'Re:' prefix so the mail stays in the thread; non-ASCII is RFC 2047 encoded). Give every job of the same family of routine the SAME subject so their emails land under one recognisable title instead of the generic thread subject. Only platforms that carry a title (email today) act on it; other platforms ignore it. Omit to fall back to the job name, then the thread's own subject. On update, '' clears."
+            },
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1082,7 +1091,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned")
+    "paused_reason", "pinned", "subject")
 
 
 def _cronjob_handler(args, **kw):

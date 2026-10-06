@@ -13,7 +13,7 @@ import smtplib
 import socket
 import ssl
 import uuid
-from email.header import decode_header
+from email.header import Header, decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -298,6 +298,26 @@ def _rtl_html_body_part(body: str) -> Optional[MIMEText]:
         + "</div></body>\n</html>"
     )
     return MIMEText(html_body, "html", "utf-8")
+
+
+def _header_value(raw: str) -> str:
+    """RFC 2047 encoded-word for a header value that may carry non-ASCII text.
+
+    A bare ``msg['Subject'] = hebrew`` writes the raw bytes into the header, which
+    renders as mojibake (or drops the line) in most clients; ``Header.encode()``
+    emits ``=?utf-8?b?...?=`` instead. ASCII passes through unchanged.
+
+    Line breaks are folded to spaces FIRST: a Subject reaches here straight from a job
+    name / configured title, and ``email`` raises ``HeaderWriteError`` while serializing a
+    header whose value still contains ``\\r``/``\\n`` — which aborts delivery of the whole
+    message. The mail keeps going out under a single-line title instead.
+    """
+    flat = " ".join(str(raw).splitlines()).strip()
+    try:
+        flat.encode("ascii")
+        return flat
+    except UnicodeEncodeError:
+        return Header(flat, "utf-8").encode()
 
 
 def _attach_body(msg: MIMEMultipart, body: str) -> None:
@@ -862,24 +882,31 @@ class EmailAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Send an email reply to the given address. ``metadata['thread_id']`` selects the reply chain."""
+        """Send an email reply to the given address. ``metadata['thread_id']`` selects the reply chain;
+        ``metadata['subject']`` sets an explicit Subject line for this message."""
         thread_id = (metadata or {}).get("thread_id")
-        return await self._run_send(self._send_email, (chat_id, content, reply_to, thread_id), "[Email] Send failed to %s: %s", chat_id)
+        subject = (metadata or {}).get("subject")
+        return await self._run_send(self._send_email, (chat_id, content, reply_to, thread_id, subject), "[Email] Send failed to %s: %s", chat_id)
 
     def _message_id_domain(self) -> str:
         """Domain for generated Message-IDs; ``localhost`` when EMAIL_ADDRESS lacks ``@``."""
         return (self._address.rsplit("@", 1)[-1] if "@" in self._address else "") or "localhost"
 
     def _new_reply(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None, *,
-                   attach_empty_body: bool = False, thread_id: Optional[str] = None) -> Tuple[MIMEMultipart, str, str]:
+                   attach_empty_body: bool = False, thread_id: Optional[str] = None,
+                   subject_override: Optional[str] = None) -> Tuple[MIMEMultipart, str, str]:
         """Build a threaded reply skeleton. Returns ``(msg, msg_id, subject)``.
 
         The chain is selected by *thread_id* (the root Message-ID); falling back
         to *to_addr* keeps callers that have no thread context working.
+
+        *subject_override* replaces the derived ``Re: <thread subject>`` line — used by
+        scheduled jobs that need a per-job title. Threading headers (In-Reply-To /
+        References) are unaffected, so the mail still lands inside the thread.
         """
         msg = MIMEMultipart()
         ctx = (self._thread_context.get(thread_id, {}) if thread_id else {}) or self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
+        subject = (subject_override or "").strip() or ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
         original_msg_id = reply_to_msg_id or ctx.get("message_id")
@@ -888,7 +915,7 @@ class EmailAdapter(BasePlatformAdapter):
         references = original_msg_id if reply_to_msg_id else (ctx.get("references") or original_msg_id)
         threading = (("In-Reply-To", original_msg_id), ("References", str(references))) if original_msg_id else ()
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
-        for key, value in (("From", self._address), ("To", to_addr), ("Subject", subject), *threading,
+        for key, value in (("From", self._address), ("To", to_addr), ("Subject", _header_value(subject)), *threading,
                            ("Date", formatdate(localtime=True)), ("Message-ID", msg_id)):
             msg[key] = value
         if body or attach_empty_body:
@@ -908,18 +935,21 @@ class EmailAdapter(BasePlatformAdapter):
                 smtp.close()
 
     def _send_email(self, to_addr: str, body: str, reply_to_msg_id: Optional[str] = None,
-                    thread_id: Optional[str] = None) -> str:
+                    thread_id: Optional[str] = None, subject_override: Optional[str] = None) -> str:
         """Send an email via SMTP. Runs in executor thread."""
-        msg, msg_id, subject = self._new_reply(to_addr, body, reply_to_msg_id, attach_empty_body=True, thread_id=thread_id)
+        msg, msg_id, subject = self._new_reply(to_addr, body, reply_to_msg_id, attach_empty_body=True,
+                                               thread_id=thread_id, subject_override=subject_override)
         self._smtp_send(msg)
         logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
         return msg_id
 
     def _send_with_files(self, to_addr: str, body: str, files: List[Tuple[Path, str]], *, lenient: bool,
-                         reply_to_msg_id: Optional[str] = None, thread_id: Optional[str] = None) -> str:
+                         reply_to_msg_id: Optional[str] = None, thread_id: Optional[str] = None,
+                         subject_override: Optional[str] = None) -> str:
         """Send a reply with attachments; *lenient* logs-and-skips unattachable files instead of raising.
         An explicit *reply_to_msg_id* threads the mail like ``_send_email`` does (#10131)."""
-        msg, msg_id, _ = self._new_reply(to_addr, body, reply_to_msg_id, thread_id=thread_id)
+        msg, msg_id, _ = self._new_reply(to_addr, body, reply_to_msg_id, thread_id=thread_id,
+                                         subject_override=subject_override)
         for path, name in files:
             try:
                 _attach_file(msg, path, name)
@@ -994,16 +1024,21 @@ class EmailAdapter(BasePlatformAdapter):
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
                             file_name: Optional[str] = None, reply_to: Optional[str] = None,
                             metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
-        """Send a file as an email attachment. ``metadata['thread_id']`` selects the reply chain."""
+        """Send a file as an email attachment. ``metadata['thread_id']`` selects the reply chain;
+        ``metadata['subject']`` sets an explicit Subject line for this message."""
         thread_id = (metadata or {}).get("thread_id")
-        return await self._run_send(self._send_email_with_attachment, (chat_id, caption or "", file_path, file_name, reply_to, thread_id),
+        subject = (metadata or {}).get("subject")
+        return await self._run_send(self._send_email_with_attachment,
+                                    (chat_id, caption or "", file_path, file_name, reply_to, thread_id, subject),
                                     "[Email] Send document failed: %s")
 
     def _send_email_with_attachment(self, to_addr: str, body: str, file_path: str, file_name: Optional[str] = None,
-                                    reply_to_msg_id: Optional[str] = None, thread_id: Optional[str] = None) -> str:
+                                    reply_to_msg_id: Optional[str] = None, thread_id: Optional[str] = None,
+                                    subject_override: Optional[str] = None) -> str:
         """Send an email with a single file attachment via SMTP (raises if unattachable)."""
         return self._send_with_files(to_addr, body, [(Path(file_path), file_name or Path(file_path).name)], lenient=False,
-                                     reply_to_msg_id=reply_to_msg_id, thread_id=thread_id)
+                                     reply_to_msg_id=reply_to_msg_id, thread_id=thread_id,
+                                     subject_override=subject_override)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about the email chat. Thread context is keyed by thread root, not chat id."""
@@ -1011,8 +1046,10 @@ class EmailAdapter(BasePlatformAdapter):
 
 
 # Plugin glue: register() exposes the platform via the registry; EMAIL_* env → PlatformConfig seeding stays in core.
-async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
-    """Out-of-process Email delivery via SMTP (one-shot); standalone_sender_fn contract."""
+async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False,
+                           subject=None):
+    """Out-of-process Email delivery via SMTP (one-shot); standalone_sender_fn contract.
+    *subject* sets the Subject header (cron jobs use it for a per-job title); absent falls back to the default."""
     extra = getattr(pconfig, "extra", {}) or {}
     address, password = extra.get("address") or _get_secret("EMAIL_ADDRESS", ""), _get_secret("EMAIL_PASSWORD", "")
     smtp_host, smtp_port = extra.get("smtp_host") or _get_secret("EMAIL_SMTP_HOST", ""), _esecret_int("EMAIL_SMTP_PORT", 587)
@@ -1023,7 +1060,7 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     try:
         msg = MIMEMultipart()
         _attach_body(msg, message)
-        for key, value in (("From", address), ("To", chat_id), ("Subject", "Hermes Agent"), ("Date", formatdate(localtime=True))):
+        for key, value in (("From", address), ("To", chat_id), ("Subject", _header_value((subject or "").strip() or "Hermes Agent")), ("Date", formatdate(localtime=True))):
             msg[key] = value
         for descriptor in media_files or []:
             # send_message normalizes MEDIA entries to ``(path, is_voice)`` tuples

@@ -2,10 +2,12 @@
 react); works in both CLI and gateway contexts."""
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 from functools import partial
+from typing import Optional
 
 from agent.secret_scope import get_secret
 
@@ -537,14 +539,16 @@ async def _dispatch_on_gateway_loop(runner, make_coro, log_message):
 
 
 async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None, media_files=None,
-                            force_document=False):
+                            force_document=False, subject=None):
     """Live in-process gateway adapter first, else the plugin's ``standalone_sender_fn`` (cron),
-    else an error naming both; media uses the adapter's native media APIs under the same rules."""
+    else an error naming both; media uses the adapter's native media APIs under the same rules.
+    ``subject`` rides metadata for adapters that carry a title (email)."""
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     runner, adapter = _live_adapter(platform)
     if adapter is not None:
         try:
-            metadata = {**({"thread_id": thread_id} if thread_id else {}),
+            metadata = {**(subject_metadata(subject)),
+                        **({"thread_id": thread_id} if thread_id else {}),
                         **({"publish_topic": chat_id} if platform_name == "ntfy" and chat_id else {})} or None
             if media_files:  # always a dict result, returned as-is below
                 make_coro = lambda: _send_live_adapter_media(  # noqa: E731
@@ -573,8 +577,8 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None
                           f"connected? For out-of-process delivery (e.g. cron in a separate process), the platform "
                           f"plugin must register a standalone_sender_fn on its PlatformEntry.")}
     try:
-        result = await sender(pconfig, chat_id, chunk, thread_id=thread_id, media_files=media_files,
-                              force_document=force_document)
+        result = await _call_standalone_sender(sender, pconfig, chat_id, chunk, thread_id=thread_id,
+                                               media_files=media_files, force_document=force_document, subject=subject)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -627,7 +631,7 @@ _PLUGIN_STANDALONE_MEDIA = {"discord": ("Discord", False, True, [], False), "fei
 
 
 async def _send_plugin_standalone(platform_name, pconfig, chat_id, message, chunks, media_files, *, thread_id,
-                                  max_len, force_document, mentions=None):
+                                  max_len, force_document, mentions=None, subject=None):
     """Chunked send through a plugin's standalone_sender_fn; one captionable file + short text
     rides as the media caption. WhatsApp re-pings recipients on every message that carries
     ``mentions``, so only the first payload of a logical send gets them."""
@@ -641,19 +645,57 @@ async def _send_plugin_standalone(platform_name, pconfig, chat_id, message, chun
         # Cap on the platform's own message limit so the caption is deliverable.
         caption, _ = _media_caption_split(message, media_files, max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT))
         if caption is not None:
-            return await sender(pconfig, chat_id, "", thread_id=thread_id, media_files=media_files,
-                                caption=caption, **extra, **first_only)
+            return await _call_standalone_sender(sender, pconfig, chat_id, "", thread_id=thread_id,
+                                                 media_files=media_files, caption=caption, subject=subject,
+                                                 **extra, **first_only)
 
     def send_one(chunk, is_last):
         kwargs = {**extra, **first_only}
         first_only.clear()
-        return sender(pconfig, chat_id, chunk, thread_id=thread_id,
-                      media_files=media_files if is_last else empty_media, **kwargs)
+        return _call_standalone_sender(sender, pconfig, chat_id, chunk, thread_id=thread_id,
+                                       media_files=media_files if is_last else empty_media,
+                                       subject=subject, **kwargs)
     return await _send_chunks(chunks, send_one)
 
 
-def _via_adapter_route(p, pc, cid, chunk, media, tid, fd):
-    return _send_via_adapter(p, pc, cid, chunk, thread_id=tid, media_files=media, force_document=fd)
+def _via_adapter_route(p, pc, cid, chunk, media, tid, fd, subject=None):
+    return _send_via_adapter(p, pc, cid, chunk, thread_id=tid, media_files=media, force_document=fd, subject=subject)
+
+
+def subject_metadata(subject: Optional[str]) -> dict:
+    """``metadata`` fragment carrying a per-message Subject line, or ``{}`` when unset.
+
+    Only adapters that read ``metadata['subject']`` (email today) act on it; every other
+    adapter ignores the extra key, so one call shape serves all platforms.
+    """
+    text = (subject or "").strip()
+    return {"subject": text} if text else {}
+
+
+async def _call_standalone_sender(sender, pconfig, chat_id, message, *, thread_id=None, media_files=None,
+                                  force_document=False, subject=None, **extra_kwargs):
+    """Invoke a plugin ``standalone_sender_fn``, passing *subject* only if it accepts one.
+
+    The registry contract does not include a subject parameter, so an older/other plugin's
+    sender is called exactly as before; email (which grew one) gets it by signature check.
+    ``**extra_kwargs`` (e.g. a media caption) are filtered the same way.
+    """
+    kwargs = {"thread_id": thread_id, "media_files": media_files, "force_document": force_document,
+              "subject": subject, **extra_kwargs}
+    try:
+        signature = inspect.signature(sender)
+        parameters = signature.parameters
+        accepts_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+    except (TypeError, ValueError):
+        # Introspection failed (C callable, exotic wrapper): keep the pre-subject contract
+        # arguments — thread_id/media_files/force_document and any caption — and drop only the
+        # newer keys. An empty parameter set would silently strip routing and media data from a
+        # sender that used to receive them.
+        accepts_var_kw = False
+        parameters = {key: None for key in ("thread_id", "media_files", "force_document")}
+    if not accepts_var_kw:
+        kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+    return await sender(pconfig, chat_id, message, **kwargs)
 
 
 # Native-media chunked routes for built-in platforms; media rides on the final chunk, non-final
@@ -673,23 +715,26 @@ _CHUNKED_ROUTES = {
     "email": (True, None, _via_adapter_route)}
 
 # Text-only senders for built-in platforms (generic path; media is dropped with a
-# warning). Signature: (pconfig, chat_id, chunk, thread_id) -> result.
+# warning). Signature: (pconfig, chat_id, chunk, thread_id, subject) -> result.
 _TEXT_SENDERS = {
     **{name: partial(_registry_standalone_send, name)
        for name in ("whatsapp", "email", "sms", "dingtalk", "feishu", "wecom")},
-    "signal": lambda pc, cid, chunk, tid: _send_signal(pc.extra, cid, chunk),
-    "bluebubbles": lambda pc, cid, chunk, tid: _send_bluebubbles(pc.extra, cid, chunk),
-    "qqbot": lambda pc, cid, chunk, tid: _send_qqbot(pc, cid, chunk),
-    "yuanbao": lambda pc, cid, chunk, tid: _send_yuanbao(cid, chunk)}
+    "signal": lambda pc, cid, chunk, tid, subject=None: _send_signal(pc.extra, cid, chunk),
+    "bluebubbles": lambda pc, cid, chunk, tid, subject=None: _send_bluebubbles(pc.extra, cid, chunk),
+    "qqbot": lambda pc, cid, chunk, tid, subject=None: _send_qqbot(pc, cid, chunk),
+    "yuanbao": lambda pc, cid, chunk, tid, subject=None: _send_yuanbao(cid, chunk)}
 
 _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp, slack and email"
 
 
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None,
-                            force_document=False, mentions=None, args=None):
+                            force_document=False, mentions=None, args=None, subject=None):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
-    lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text."""
+    lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text.
+
+    ``subject`` is an optional per-message Subject/header line (email and other title-carrying
+    platforms); senders that have no such concept ignore it."""
     from gateway.config import Platform
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     media_files = media_files or []
@@ -707,12 +752,13 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             or (media_files and platform_name in _PLUGIN_STANDALONE_MEDIA)):
         return await _send_plugin_standalone(platform_name, pconfig, chat_id, message, chunks, media_files,
                                              thread_id=thread_id, max_len=max_len, force_document=force_document,
-                                             mentions=mentions)
+                                             mentions=mentions, subject=subject)
     route = _CHUNKED_ROUTES.get(platform_name)
     if route is not None and (media_files or not route[0]):
         _, empty_media, sender = route
         return await _send_chunks(chunks, lambda chunk, is_last: sender(
-            platform, pconfig, chat_id, chunk, media_files if is_last else empty_media, thread_id, force_document))
+            platform, pconfig, chat_id, chunk, media_files if is_last else empty_media, thread_id, force_document,
+            subject))
 
     # Generic path: text only. Buzz delivers media natively via _send_via_adapter, so no warning.
     warning = None
@@ -724,7 +770,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                    f"native send_message media delivery is currently only supported for {_MEDIA_PLATFORMS_NOTE}")
     text_sender = _TEXT_SENDERS.get(platform_name)
     if text_sender is not None:
-        send_one = lambda chunk, is_last: text_sender(pconfig, chat_id, chunk, thread_id)  # noqa: E731
+        send_one = lambda chunk, is_last: text_sender(pconfig, chat_id, chunk, thread_id, subject)  # noqa: E731
     else:
         from gateway.platform_registry import platform_registry
         entry = platform_registry.get(platform_name)

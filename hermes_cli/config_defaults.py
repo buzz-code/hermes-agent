@@ -1813,6 +1813,10 @@ DEFAULT_CONFIG = {
         # Wrap delivered cron responses with a task-name header and "The agent cannot see this
         # message" footer. False = clean output.
         "wrap_response": True,
+        # When a job carries no explicit `subject`, title its email deliveries with the job's
+        # own name instead of the generic thread subject, so each routine is recognisable in
+        # the inbox. False = every job keeps the thread's own subject.
+        "subject_from_name": True,
         "delivery": {  # Delivery behaviour for cron output sent through a live gateway adapter.
             # Mark cron deliveries FINAL so the platform pushes them (Telegram's "important" mode
             # otherwise sends with disable_notification=True and briefs look undelivered). False =
