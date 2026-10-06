@@ -306,12 +306,18 @@ def _header_value(raw: str) -> str:
     A bare ``msg['Subject'] = hebrew`` writes the raw bytes into the header, which
     renders as mojibake (or drops the line) in most clients; ``Header.encode()``
     emits ``=?utf-8?b?...?=`` instead. ASCII passes through unchanged.
+
+    Line breaks are folded to spaces FIRST: a Subject reaches here straight from a job
+    name / configured title, and ``email`` raises ``HeaderWriteError`` while serializing a
+    header whose value still contains ``\\r``/``\\n`` — which aborts delivery of the whole
+    message. The mail keeps going out under a single-line title instead.
     """
+    flat = " ".join(str(raw).splitlines()).strip()
     try:
-        raw.encode("ascii")
-        return raw
+        flat.encode("ascii")
+        return flat
     except UnicodeEncodeError:
-        return Header(raw, "utf-8").encode()
+        return Header(flat, "utf-8").encode()
 
 
 def _attach_body(msg: MIMEMultipart, body: str) -> None:

@@ -687,7 +687,12 @@ async def _call_standalone_sender(sender, pconfig, chat_id, message, *, thread_i
         parameters = signature.parameters
         accepts_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
     except (TypeError, ValueError):
-        parameters, accepts_var_kw = {}, False
+        # Introspection failed (C callable, exotic wrapper): keep the pre-subject contract
+        # arguments — thread_id/media_files/force_document and any caption — and drop only the
+        # newer keys. An empty parameter set would silently strip routing and media data from a
+        # sender that used to receive them.
+        accepts_var_kw = False
+        parameters = {key: None for key in ("thread_id", "media_files", "force_document")}
     if not accepts_var_kw:
         kwargs = {key: value for key, value in kwargs.items() if key in parameters}
     return await sender(pconfig, chat_id, message, **kwargs)

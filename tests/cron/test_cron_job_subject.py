@@ -277,10 +277,13 @@ class TestLiveRouteMetadataCarriesSubject:
 class TestStandaloneLaneCarriesSubject:
 
     @staticmethod
-    def _deliver(job, sender):
+    def _deliver(job, sender, cron_config=None):
+        """Drive the standalone lane. *cron_config* overrides the ``cron:`` section; it is
+        patched HERE (not by the caller) because an inner patch of the same target would
+        silently replace an outer one for the duration of the send."""
         with patch("gateway.config.load_gateway_config", return_value=_gateway_config()), \
              patch("cron.scheduler.load_config",
-                   return_value={"cron": {"wrap_response": False}}), \
+                   return_value=cron_config or {"cron": {"wrap_response": False}}), \
              patch("cron.scheduler_delivery._record_delivery_verification"), \
              patch("tools.send_message_tool._send_to_platform", sender):
             from cron.scheduler import _deliver_result
@@ -308,17 +311,20 @@ class TestStandaloneLaneCarriesSubject:
         assert seen["subject"] == "Yad2 printer watch"
 
     def test_subject_is_omitted_when_the_fallback_is_disabled(self):
+        """With ``subject_from_name`` off, a job that carries no ``subject`` of its own is
+        still delivered — under the thread's own subject. The send must not be skipped."""
         seen = {}
 
         async def _spy(platform, pconfig, chat_id, text, **kwargs):
             seen.update(kwargs)
             return {"success": True, "message_id": 7}
 
-        with patch("cron.scheduler.load_config",
-                   return_value={"cron": {"wrap_response": False, "subject_from_name": False}}):
-            from cron.scheduler import _deliver_result
-            _deliver_result(_job(), "found one")
-        assert seen == {}  # the send never happened with the gate shut
+        error = self._deliver(_job(), _spy,
+                              cron_config={"cron": {"wrap_response": False, "subject_from_name": False}})
+
+        assert error is None
+        assert seen.get("subject") is None
+        assert seen["thread_id"] is None  # the send really went through this spy
 
     def test_standalone_sender_that_takes_no_subject_is_called_as_before(self):
         """The registry contract does not include `subject`; an older/other
@@ -351,6 +357,27 @@ class TestStandaloneLaneCarriesSubject:
             _with_subject_sender, object(), "a@b.com", "body",
             subject="Printer watch")).get("success") is True
         assert seen["subject"] == "Printer watch"
+
+    def test_introspection_failure_keeps_the_legacy_arguments(self):
+        """``inspect.signature`` cannot describe every callable. When it fails, the sender
+        must still receive the arguments it received before ``subject`` existed — routing
+        (``thread_id``) and media — and only the newer keys are dropped."""
+        from tools.send_message_tool import _call_standalone_sender
+
+        seen = {}
+
+        async def _sender(pconfig, chat_id, text, *, thread_id=None, media_files=None,
+                          force_document=False):
+            seen.update(thread_id=thread_id, media_files=media_files, force_document=force_document)
+            return {"success": True}
+
+        with patch("tools.send_message_tool.inspect.signature", side_effect=ValueError("no signature")):
+            result = asyncio.run(_call_standalone_sender(
+                _sender, object(), "a@b.com", "body", thread_id="t1",
+                media_files=["f.png"], force_document=True, subject="Printer watch"))
+
+        assert result.get("success") is True
+        assert seen == {"thread_id": "t1", "media_files": ["f.png"], "force_document": True}
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +521,24 @@ class TestHeaderValueHelper:
         assert encoded.isascii()
         chunk, charset = decode_header(encoded)[0]
         assert chunk.decode(charset) == "שלום"
+
+    def test_line_breaks_are_folded_so_serialization_cannot_fail(self):
+        """A title arrives straight from a job name / ``subject`` field, so it can carry a
+        line break. ``email`` raises ``HeaderWriteError`` while serializing a header whose
+        value still contains one, which would abort the whole delivery — fold it instead."""
+        from email.mime.multipart import MIMEMultipart
+
+        from plugins.platforms.email.adapter import _header_value
+
+        for raw, expected in (("watch\nnow", "watch now"), ("a\r\nb", "a b"),
+                              ("שלום\nעולם", "שלום עולם")):
+            folded = _header_value(raw)
+            assert "\n" not in folded and "\r" not in folded
+            msg = MIMEMultipart()
+            msg["Subject"] = folded
+            msg.as_bytes()  # raises if the value can still break the header
+            chunk, charset = decode_header(folded)[0]
+            assert (chunk.decode(charset) if charset else chunk) == expected
 
 
 # ---------------------------------------------------------------------------
