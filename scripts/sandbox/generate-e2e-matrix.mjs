@@ -520,6 +520,21 @@ function readStdin() {
   });
 }
 
+/**
+ * Parse the `--tags` argument. The workflows interpolate
+ * `${{ needs.pick-releases.outputs.tags }}`, which is the EMPTY STRING when
+ * that job never ran (skipped, e.g. on a fork guard). An empty value means
+ * "no tags", not malformed JSON, so map it to [] before parsing -- otherwise
+ * the report job dies with a SyntaxError on an otherwise-clean run.
+ *
+ * @param {string} raw
+ * @returns {TagAnnotation[]}
+ */
+function parseTags(raw) {
+  if (!raw.trim()) return [];
+  return /** @type {TagAnnotation[]} */ (JSON.parse(raw));
+}
+
 async function main() {
   const { values } = parseArgs({
     options: {
@@ -531,7 +546,7 @@ async function main() {
   });
   if (values.format === 'results') {
     const jobs = (await readStdin()).split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
-    const annotations = /** @type {TagAnnotation[]} */ (JSON.parse(values.tags));
+    const annotations = parseTags(values.tags);
     /** @type {Map<string, number>} */
     const artifactById = new Map();
     if (values.artifacts) {
@@ -544,7 +559,7 @@ async function main() {
     process.stdout.write(renderMarkdownResults(jobs, annotations, artifactById));
     return;
   }
-  const tags = /** @type {TagAnnotation[]} */ (JSON.parse(values.tags));
+  const tags = parseTags(values.tags);
   const envs = generateEnvironments(SPEC);
   if (values.format === 'markdown') {
     process.stdout.write(renderMarkdownPlan(envs, tags));
