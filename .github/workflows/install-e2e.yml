@@ -168,6 +168,15 @@ concurrency:
 jobs:
   pick-releases:
     name: Pick release tags
+    # Only the upstream repository has release tags to sample. A fork has none
+    # of its own, and pick-release-tags.sh exits 1 on an empty tag list rather
+    # than emit an empty matrix (its strictness is the canary for a checkout
+    # that lost its tags). From inside the script a fork is indistinguishable
+    # from that fault, so the distinction belongs here. Every job that
+    # consumes the picked tags declares `needs: pick-releases` and skips with
+    # it -- except the report, which opts back in with `always()` and is
+    # guarded separately below.
+    if: github.repository == 'NousResearch/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
