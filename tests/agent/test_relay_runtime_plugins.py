@@ -566,6 +566,22 @@ def test_present_plugins_section_is_validated_even_when_falsey(
         host.shutdown()
 
 
+def test_active_log_names_every_loaded_configuration_file(explicit_static_config, caplog):
+    report = {
+        **ACTIVE_ACTIVATION_REPORT,
+        "config_paths": [str(explicit_static_config), "/etc/nemo-relay/plugins.toml"],
+    }
+    relay = _FakeRelay(activation_report=report)
+
+    with caplog.at_level("INFO"):
+        host = relay_runtime.RelayRuntime(relay=relay, profile_key="profile")
+    try:
+        [line] = [r.getMessage() for r in caplog.records if "active process-wide" in r.getMessage()]
+        assert all(path in line for path in report["config_paths"])
+    finally:
+        host.shutdown()
+
+
 def test_two_profile_hosts_initialize_once_and_clear_after_final_shutdown(
     explicit_static_config,
     caplog,
