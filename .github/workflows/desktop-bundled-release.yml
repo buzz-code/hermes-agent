@@ -192,6 +192,14 @@ env:
 jobs:
   validate:
     name: Pre-build setup
+    # Fork guard: this release pipeline only has a working environment upstream.
+    # A fork has no release-signing environment and no vYYYY.M.D tags, so the
+    # daily dispatch from Canary Release (scripts/release.py) can never get past
+    # admission here — it only reddens the fork's Actions once a day, with every
+    # other job skipped. Skipping this job skips the whole run; upstream, where
+    # github.repository matches, the job runs exactly as before. Same shape as
+    # the install-e2e fork guards.
+    if: github.repository == 'NousResearch/hermes-agent'
     # One dispatch: in disposable mode the allocation steps run first (the
     # channel pin comes from them), then admission validates the build source.
     # A failed allocation fails this job and skips everything downstream.
