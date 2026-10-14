@@ -28,8 +28,17 @@ jobs:
   tag:
     name: Tag, draft, and start the canary build
     runs-on: ubuntu-24.04
+    # Fork guard: the canary resolves the published stable identity from the
+    # shared release host, and that record is authored by upstream, so a fork's
+    # read is refused ("Channel repository authority mismatch") and reddens its
+    # Actions once a day. Skipping this job skips the run: prune needs it and
+    # already declines a skipped parent. Upstream, where github.repository
+    # matches, is unchanged. Same shape as the install-e2e and
+    # desktop-bundled-release fork guards.
     # A dispatch from a feature branch would tag unmerged code as the canary.
-    if: github.ref_name == github.event.repository.default_branch
+    if: >-
+      github.repository == 'NousResearch/hermes-agent' &&
+      github.ref_name == github.event.repository.default_branch
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
