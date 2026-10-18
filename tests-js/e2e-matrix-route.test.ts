@@ -20,6 +20,11 @@ function legNames(matrices: Matrices): string[] {
   return Object.values(matrices).flatMap(m => m.include.map(leg => leg.name))
 }
 
+/** Run with an explicit `--tags` value, the way the workflow interpolates it. */
+function run(args: string[], stdin = ''): string {
+  return execFileSync(process.execPath, [script, ...args], { encoding: 'utf8', input: stdin })
+}
+
 test('a leg name, or the job name GitHub shows for it, runs exactly that leg', () => {
   const leg: Leg | undefined = generate('all').windows.include.find(l =>
     l.name.includes('installer-script+desktop -> desktop-installer@latest')
@@ -52,4 +57,20 @@ test('the pr route runs one script install updated by hermes update per OS start
     'macos: installer-script -> hermes-update (v2026.6.19 -> HEAD)',
     'windows: installer-script -> hermes-update (HEAD -> NEXT)',
   ])
+})
+
+// A skipped pick-releases job outputs the empty string, and the report step
+// passes it straight through as `--tags ''`. Reading that as malformed JSON
+// turned an all-skipped run (every fork) red in the report job.
+test('an empty --tags reads as no starting points, not malformed JSON', () => {
+  const jobs = `${JSON.stringify({ name: 'Result chart', conclusion: null, html_url: 'u', steps: [] })}\n`
+
+  expect(run(['--format', 'results', '--tags', '', '--artifacts', '/dev/null'], jobs))
+    .toContain('no legs found in this run')
+  expect(() => run(['--tags', '', '--route', 'all'])).not.toThrow()
+  expect(() => run(['--format', 'markdown', '--tags', ''])).not.toThrow()
+})
+
+test('malformed --tags still fails loudly rather than silently covering nothing', () => {
+  expect(() => run(['--tags', '{oops'])).toThrow()
 })
