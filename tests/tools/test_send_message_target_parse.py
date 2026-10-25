@@ -24,6 +24,16 @@ def test_buzz_uuid_target_is_explicit() -> None:
     assert _parse_target_ref("buzz", channel_id) == (channel_id, None, True)
 
 
+def test_email_target_with_message_id_is_explicit_and_threads() -> None:
+    """addr:<message-id> is explicit AND carries the thread anchor, so a send replies in that
+    thread instead of opening a new one (fork email-threading feature)."""
+    assert _parse_target_ref("email", "user@example.com:<abc@mail.com>") == (
+        "user@example.com", "<abc@mail.com>", True)
+    assert _parse_target_ref("email", "user@example.com") == ("user@example.com", None, True)
+    # Malformed addr-spec still falls through to channel-directory resolution.
+    assert _parse_target_ref("email", "user@.com")[2] is False
+
+
 def test_live_buzz_media_delivers_every_file_with_reply_metadata(tmp_path) -> None:
     from gateway.platforms.base import SendResult
 
