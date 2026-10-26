@@ -1293,6 +1293,48 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
 _LIVE_SEND_CONFIRM_TIMEOUT_SECS = 60
 
 
+def _live_send_email_combined(
+    t: _TargetDelivery, text_to_send: str, media_files: list, route_metadata: dict, *,
+    target_errors: list,
+) -> tuple[bool, bool, Any]:
+    """Send body + attachments as ONE email; returns ``(adapter_ok, timed_out, message_id)``.
+
+    Only used for email targets whose adapter implements ``send_with_attachments``. Sending the body
+    and then each file separately produces a body-less attachment mail that the user reads as a
+    duplicate of the report, so a payload that has both leaves as a single message.
+    """
+    from agent.async_utils import safe_schedule_threadsafe
+    job = t.job
+    paths = [str(p) for p, _is_voice in media_files]
+    metadata = dict(route_metadata or {})
+    future = safe_schedule_threadsafe(
+        t.runtime_adapter.send_with_attachments(t.chat_id, text_to_send, paths, metadata=metadata), t.loop)
+    if future is None:
+        target_errors.append("live adapter event loop scheduling failed")
+        return False, False, None
+    try:
+        send_result = future.result(timeout=_LIVE_SEND_CONFIRM_TIMEOUT_SECS)
+    except TimeoutError:
+        # Same rule as the text lane: an in-flight send is not a failure, and a standalone resend
+        # would duplicate the mail.
+        logger.warning(
+            "Job '%s': combined email send to %s timed out after %ss; assuming in flight",
+            job["id"], t.where, _LIVE_SEND_CONFIRM_TIMEOUT_SECS)
+        return True, True, None
+    except Exception as ex:
+        t.live_error = str(ex)
+        target_errors.append(f"live adapter send failed: {ex}")
+        raise
+    if not _confirm_adapter_delivery(send_result, job["id"]):
+        err = getattr(send_result, "error", None) or "unknown"
+        msg = f"live adapter send to {t.where} returned unconfirmed result (email with attachments, error={err})"
+        t.live_error = str(err)
+        _warn_live_lane_failure(job, msg, t.is_relay)
+        target_errors.append(msg)
+        return False, False, None
+    return True, False, _result_field(send_result, "message_id")
+
+
 def _live_send_text(
     t: _TargetDelivery, text_to_send: str, route_thread_id: Optional[str], route_metadata: dict, *,
     target_errors: list, delivery_errors: list, unverified_targets: list,
@@ -1480,12 +1522,20 @@ def _deliver_via_live_adapter(
         # the same platform routing as live messages (Telegram's three-mode topic routing).
         text_to_send = cleaned_text.strip()
         adapter_ok, timed_out, delivered_message_id = True, False, None
+        # Email: body + attachments leave as ONE mail. Sent separately, the report arrives first and
+        # every attachment follows as its own body-less mail, which reads as a duplicate report.
+        single_mail = bool(
+            media_files and t.platform_name == "email"
+            and callable(getattr(t.runtime_adapter, "send_with_attachments", None)))
         if not text_to_send and not media_files:
             # Fail closed so the run reports the empty payload.
             _note_target_error(
                 job, f"live adapter send skipped (empty text and no media) for {t.where}",
                 target_errors)
             adapter_ok = False
+        elif single_mail:
+            adapter_ok, timed_out, delivered_message_id = _live_send_email_combined(
+                t, text_to_send, media_files, route_metadata, target_errors=target_errors)
         elif text_to_send:
             adapter_ok, timed_out, delivered_message_id = _live_send_text(
                 t, text_to_send, route_thread_id, route_metadata,
@@ -1501,9 +1551,9 @@ def _deliver_via_live_adapter(
         # gateway loop is contended, so each media send would also block its 30s budget, and the text
         # payload is already assumed delivered (#38922). Record the skipped attachments so the drop is
         # visible rather than silently lost.
-        if adapter_ok and not timed_out and media_files:
+        if adapter_ok and not timed_out and media_files and not single_mail:
             _live_send_media(t, media_metadata, media_files, delivery_errors)
-        elif timed_out and media_files:
+        elif timed_out and media_files and not single_mail:
             _note_target_error(
                 job,
                 f"{len(media_files)} media attachment(s) not delivered to "

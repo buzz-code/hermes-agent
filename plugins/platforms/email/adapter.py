@@ -1098,7 +1098,7 @@ class EmailAdapter(BasePlatformAdapter):
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
                             file_name: Optional[str] = None, reply_to: Optional[str] = None,
-                            metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+                            metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
         """Send a file as an email attachment. ``metadata['thread_id']`` selects the reply chain;
         ``metadata['subject']`` sets an explicit Subject line for this message."""
         thread_id = (metadata or {}).get("thread_id")
@@ -1114,6 +1114,33 @@ class EmailAdapter(BasePlatformAdapter):
         return self._send_with_files(to_addr, body, [(Path(file_path), file_name or Path(file_path).name)], lenient=False,
                                      reply_to_msg_id=reply_to_msg_id, thread_id=thread_id,
                                      subject_override=subject_override)
+
+    def _send_email_with_body_and_files(self, to_addr: str, body: str, file_paths: list[str],
+                                        thread_id: Optional[str] = None,
+                                        subject_override: Optional[str] = None) -> str:
+        """Body text + all attachments in ONE MIME message (unattachable files are skipped)."""
+        msg_id = self._send_with_files(to_addr, body, [(Path(f), Path(f).name) for f in file_paths], lenient=True,
+                                      thread_id=thread_id, subject_override=subject_override)
+        logger.info("[Email] Sent single email to %s (body + %d attachment(s))", to_addr, len(file_paths))
+        return msg_id
+
+    async def send_with_attachments(self, chat_id: str, text: str, file_paths: list[str],
+                                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        """Send ONE email carrying both the body and every file.
+
+        A caller that knows its files up front must not send text and attachments as separate
+        messages: the attachment-only follow-up has no body and reads like a duplicate of the
+        report. ``metadata['thread_id']`` selects the reply chain, ``metadata['subject']`` the
+        Subject line (same contract as ``send``).
+        """
+        paths = [str(p) for p in (file_paths or []) if p]
+        if not paths:
+            return await self.send(chat_id, text, metadata=metadata)
+        thread_id = (metadata or {}).get("thread_id")
+        subject = (metadata or {}).get("subject")
+        return await self._run_send(self._send_email_with_body_and_files,
+                                    (chat_id, text or "", paths, thread_id, subject),
+                                    "[Email] Send with attachments failed to %s: %s", chat_id)
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         """Return basic info about the email chat. Thread context is keyed by thread root, not chat id."""
