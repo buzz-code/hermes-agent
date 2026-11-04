@@ -12,6 +12,14 @@ from hermes_state_runtime import list_session_admissions
 
 CHAT = '15551234567@s.whatsapp.net'
 
+# A top-posted mail reply: the owner's one word, then the quoted original below it.
+TOP_POSTED_YES = (
+    "yes\n\n"
+    "On Tue, Nov 4, 2026 at 18:15 Hermes <hermes@example.com> wrote:\n"
+    "> I want to run a command that needs your OK\n"
+    "> ```\n> rm -rf build\n> ```\n"
+)
+
 
 class _RunningAgent:
     def __init__(self):
@@ -23,7 +31,8 @@ class _RunningAgent:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('mode', ['interrupt', 'queue'])
-async def test_busy_plaintext_yes_resolves_blocking_approval_not_interrupt_or_queue(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize('reply', ['yes', TOP_POSTED_YES])
+async def test_busy_plaintext_yes_resolves_blocking_approval_not_interrupt_or_queue(tmp_path, monkeypatch, mode, reply):
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
     from tools.approval import _gateway_queues
     from tools.approval_gateway_wait import _ApprovalEntry
@@ -50,7 +59,7 @@ async def test_busy_plaintext_yes_resolves_blocking_approval_not_interrupt_or_qu
     entry = _ApprovalEntry({'command': 'rm -rf build'})
     _gateway_queues.setdefault(key, []).append(entry)
     try:
-        handled = asyncio.ensure_future(runner._handle_message(MessageEvent(text='yes', source=source, message_id='y1')))
+        handled = asyncio.ensure_future(runner._handle_message(MessageEvent(text=reply, source=source, message_id='y1')))
         done, _ = await asyncio.wait({handled}, timeout=10)
         handled.cancel()
         assert done, '"yes" was admitted as a turn behind the blocked approval'

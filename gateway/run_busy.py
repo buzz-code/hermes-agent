@@ -631,8 +631,21 @@ class GatewayBusySessionMixin:
             # The busy-handler path does not auto-send that return, so we deliver it ourselves (mirroring
             # the draining-case send above).
             if event.allow_gateway_control and has_blocking_approval(session_key):
+                _words = self._plaintext_approval_words()
                 _raw_text = (event.text or "").strip().lower()
-                _match = self._plaintext_approval_words().get(_raw_text)
+                _match = _words.get(_raw_text)
+                if _match is None:
+                    # Email/mailing-list clients TOP-POST: the owner's answer is the first line of a
+                    # body that continues with the quoted original ("On … wrote:", "> …"). Comparing
+                    # the whole body then never matches a one-word reply. Try the first non-blank,
+                    # non-quote line too — the has_blocking_approval gate above is unchanged, so a
+                    # conversational "yes" still cannot fire a command when nothing is pending.
+                    for _line in _raw_text.splitlines():
+                        _candidate = _line.strip().lstrip(">").strip().rstrip(".,!;")
+                        if not _candidate:
+                            continue
+                        _match = _words.get(_candidate)
+                        break
                 if _match is not None:
                     _verb, _normalized_args = _match
                     _approval_handler = (
